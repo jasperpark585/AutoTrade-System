@@ -1,0 +1,68 @@
+mode: DRY-RUN
+scan_interval_seconds: 60
+default_profile:
+  note: "업계 표준 안전 디폴트. 유료프로그램 동일 수치가 있다면 paid_override 필드에 입력하세요."
+risk_limits:
+  max_daily_trades: 8
+  max_daily_loss_krw: 600000
+  max_positions: 4
+  max_buy_amount_per_trade_krw: 1500000
+  cooldown_after_consecutive_losses: 3
+  cooldown_minutes: 20
+scoring_weights:
+  universe: 20
+  pre_breakout: 25
+  trigger: 30
+  confirmation: 25
+stages:
+  universe:
+    market: [KOSPI, KOSDAQ]
+    exclude_trading_halt: true
+    exclude_management_issue: true
+    min_avg_turnover_krw: 3000000000
+    min_price_krw: 1200
+    max_spread_pct: 1.2
+    paid_override:
+      enabled: false
+      min_avg_turnover_krw: null
+  pre_breakout:
+    volume_spike_ratio_min: 2.2
+    intraday_volatility_pct_min: 1.8
+    pullback_allowed_pct_max: 3.0
+    net_buying_signal_min: 0.5
+    paid_override:
+      enabled: false
+      volume_spike_ratio_min: null
+  trigger:
+    breakout_zone_1_pct: 0.6
+    breakout_zone_2_pct: 1.2
+    breakout_zone_3_pct: 2.0
+    use_prev_high_break: true
+    use_prev_day_high_break: true
+    use_moving_avg_resistance_break: true
+    paid_override:
+      enabled: false
+      breakout_zone_1_pct: null
+      breakout_zone_2_pct: null
+      breakout_zone_3_pct: null
+  confirmation:
+    execution_strength_min: 105
+    orderbook_bid_ask_ratio_min: 1.1
+    spread_pct_max: 0.9
+    trend_slope_min: 0.2
+  entry:
+    order_type: limit
+    split_buy_count: 2
+    slippage_tolerance_pct: 0.3
+    max_entry_delay_seconds: 20
+  manage:
+    trailing_stop_pct: 1.7
+    partial_take_profit_levels_pct: [1.8, 3.5]
+    partial_take_profit_ratios: [0.4, 0.4]
+    volume_decay_exit_ratio: 0.45
+    sudden_drop_exit_pct: 2.2
+  exit:
+    stop_loss_pct: 1.8
+    take_profit_pct: 4.2
+    time_based_exit_minutes: 95
+    volatility_stop_multiplier: 1.4
