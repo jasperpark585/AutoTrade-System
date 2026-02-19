@@ -1,0 +1,8 @@
+/opt/AutoTrade-System/logs/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

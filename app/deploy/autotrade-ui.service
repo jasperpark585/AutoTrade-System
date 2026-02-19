@@ -1,0 +1,16 @@
+[Unit]
+Description=AutoTrade Streamlit UI
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/AutoTrade-System
+Environment="TZ=Asia/Seoul"
+EnvironmentFile=/opt/AutoTrade-System/.env
+ExecStart=/opt/AutoTrade-System/.venv/bin/streamlit run app/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
