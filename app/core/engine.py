@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,7 +22,7 @@ class EngineRuntime:
     enabled: bool = False
     open_positions: dict[str, dict] = field(default_factory=dict)
     daily_trades: int = 0
-    daily_loss: float = 0.0
+    daily_loss_krw: float = 0.0
     consecutive_losses: int = 0
     cooldown_until_epoch: float = 0.0
     fatal_error: str | None = None
@@ -49,6 +50,8 @@ class AutoTradingEngine:
             "enabled": self.runtime.enabled,
             "fatal_error": self.runtime.fatal_error,
             "open_positions": len(self.runtime.open_positions),
+            "daily_trades": self.runtime.daily_trades,
+            "daily_loss_krw": self.runtime.daily_loss_krw,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -64,8 +67,7 @@ class AutoTradingEngine:
         if self.runtime.cooldown_until_epoch > time.time():
             return
 
-        risk = self.config["risk_limits"]
-        if self.runtime.daily_trades >= risk["max_daily_trades"] or self.runtime.daily_loss <= -risk["max_daily_loss_krw"]:
+        if not self._risk_check_passed():
             logger.warning("Risk limit reached, trading paused.")
             return
 
@@ -90,6 +92,25 @@ class AutoTradingEngine:
             self.notifier.send(f"[치명오류] 자동매매 중지: {exc}")
             logger.exception("Fatal engine error")
 
+    def _risk_check_passed(self) -> bool:
+        risk = self.config["risk_limits"]
+        max_orders_per_day = int(risk.get("max_orders_per_day", risk.get("max_daily_trades", 0)))
+        if max_orders_per_day > 0 and self.runtime.daily_trades >= max_orders_per_day:
+            return False
+
+        max_daily_loss_krw = float(risk.get("max_daily_loss_krw", 0))
+        if max_daily_loss_krw > 0 and self.runtime.daily_loss_krw <= -max_daily_loss_krw:
+            return False
+
+        max_daily_loss_pct = float(risk.get("max_daily_loss_pct", 0))
+        if max_daily_loss_pct > 0:
+            equity = float(os.getenv("AUTOTRADE_EQUITY_BASE_KRW", str(risk.get("equity_base_krw", 0))))
+            if equity > 0:
+                loss_pct = abs(self.runtime.daily_loss_krw) / equity * 100
+                if loss_pct >= max_daily_loss_pct:
+                    return False
+        return True
+
     def _try_entry(self, symbol: str, price: float, reason: str) -> None:
         if symbol in self.runtime.open_positions:
             return
@@ -102,7 +123,7 @@ class AutoTradingEngine:
             return
 
         order = self.kis.place_order(symbol=symbol, qty=qty, side="BUY", price=price)
-        if order["status"] in {"SIMULATED", "FILLED"}:
+        if order.get("status") in {"SIMULATED", "FILLED"}:
             trade_id = self.db.open_trade(symbol, qty, price, reason)
             self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": qty}
             self.runtime.daily_trades += 1
@@ -118,10 +139,10 @@ class AutoTradingEngine:
             should_exit = change_pct <= -exit_cfg["stop_loss_pct"] or change_pct >= exit_cfg["take_profit_pct"]
             if should_exit:
                 order = self.kis.place_order(symbol=q.symbol, qty=pos["qty"], side="SELL", price=q.price)
-                if order["status"] in {"SIMULATED", "FILLED"}:
+                if order.get("status") in {"SIMULATED", "FILLED"}:
                     self.db.close_trade(pos["trade_id"], q.price, fees=500, reason_exit="auto_exit")
                     pnl = (q.price - pos["entry_price"]) * pos["qty"] - 500
-                    self.runtime.daily_loss += min(0, pnl)
+                    self.runtime.daily_loss_krw += min(0, pnl)
                     self.runtime.consecutive_losses = self.runtime.consecutive_losses + 1 if pnl < 0 else 0
                     if self.runtime.consecutive_losses >= self.config["risk_limits"]["cooldown_after_consecutive_losses"]:
                         self.runtime.cooldown_until_epoch = time.time() + self.config["risk_limits"]["cooldown_minutes"] * 60

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover
+    requests = None
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +17,9 @@ class KakaoNotifier:
     def send(self, message: str) -> bool:
         if not self.token:
             logger.info("Kakao token missing; message skipped.")
+            return False
+        if requests is None:
+            logger.warning("requests package missing; Kakao notify skipped.")
             return False
         headers = {"Authorization": f"Bearer {self.token}"}
         payload = {"template_object": '{"object_type":"text","text":"' + message + '","link":{"web_url":"https://example.com"}}'}

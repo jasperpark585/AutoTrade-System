@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -9,7 +10,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from app.core.config import ConfigManager
 from app.core.database import Database
 from app.core.engine import AutoTradingEngine
-from app.core.secrets import SecretStore
 from app.services.kakao import KakaoNotifier
 from app.utils.logging import setup_logging
 
@@ -37,10 +37,8 @@ def run() -> None:
     setup_logging()
     cfg_mgr = ConfigManager()
     db = Database()
-    secrets = SecretStore()
-    sec = secrets.load()
 
-    notifier = KakaoNotifier(token=sec.get("KAKAO_TOKEN"))
+    notifier = KakaoNotifier(token=os.getenv("KAKAO_TOKEN"))
     engine = AutoTradingEngine(cfg_mgr, db, notifier)
     engine.enable(True)
 

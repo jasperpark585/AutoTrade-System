@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
-import holidays
-import pytz
+try:
+    import holidays
+except ModuleNotFoundError:  # pragma: no cover
+    holidays = None
 
-
-KST = pytz.timezone("Asia/Seoul")
+KST = ZoneInfo("Asia/Seoul")
 
 
 @dataclass
@@ -19,8 +21,12 @@ class MarketStatus:
 
 def get_market_status(now: datetime | None = None) -> MarketStatus:
     now = now.astimezone(KST) if now else datetime.now(KST)
-    kr_holidays = holidays.country_holidays("KR", years=[now.year])
-    if now.date() in kr_holidays or now.weekday() >= 5:
+    is_holiday = False
+    if holidays is not None:
+        kr_holidays = holidays.country_holidays("KR", years=[now.year])
+        is_holiday = now.date() in kr_holidays
+
+    if is_holiday or now.weekday() >= 5:
         return MarketStatus(False, False, "휴장일 또는 주말")
 
     market_open = time(9, 0)

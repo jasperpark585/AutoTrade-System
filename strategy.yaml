@@ -1,10 +1,13 @@
 mode: DRY-RUN
 scan_interval_seconds: 60
 default_profile:
-  note: "업계 표준 안전 디폴트. 유료프로그램 동일 수치가 있다면 paid_override 필드에 입력하세요."
+  note: 업계 표준 안전 디폴트. 유료프로그램 동일 수치가 있다면 paid_override 필드에 입력하세요.
 risk_limits:
   max_daily_trades: 8
+  max_orders_per_day: 8
   max_daily_loss_krw: 600000
+  max_daily_loss_pct: 2.5
+  equity_base_krw: 30000000
   max_positions: 4
   max_buy_amount_per_trade_krw: 1500000
   cooldown_after_consecutive_losses: 3
@@ -16,7 +19,9 @@ scoring_weights:
   confirmation: 25
 stages:
   universe:
-    market: [KOSPI, KOSDAQ]
+    market:
+    - KOSPI
+    - KOSDAQ
     exclude_trading_halt: true
     exclude_management_issue: true
     min_avg_turnover_krw: 3000000000
@@ -57,8 +62,12 @@ stages:
     max_entry_delay_seconds: 20
   manage:
     trailing_stop_pct: 1.7
-    partial_take_profit_levels_pct: [1.8, 3.5]
-    partial_take_profit_ratios: [0.4, 0.4]
+    partial_take_profit_levels_pct:
+    - 1.8
+    - 3.5
+    partial_take_profit_ratios:
+    - 0.4
+    - 0.4
     volume_decay_exit_ratio: 0.45
     sudden_drop_exit_pct: 2.2
   exit:
