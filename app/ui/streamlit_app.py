@@ -15,6 +15,11 @@ from app.core.reporting import aggregate_performance, load_closed_trades, symbol
 from app.services.kakao import KakaoNotifier
 from app.utils.errors import unwrap_exception
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover
+    st_autorefresh = None
+
 st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
 
 cfg_mgr = ConfigManager()
@@ -23,7 +28,14 @@ engine = AutoTradingEngine(cfg_mgr, db, KakaoNotifier(token=os.getenv("KAKAO_TOK
 
 st.title("국내주식 완전자동 매매 시스템")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["운영 상태", "전략 설정", "환경변수", "리포트", "수동 진행/자동매매 진단"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "운영 상태",
+    "포트폴리오",
+    "전략 설정",
+    "환경변수",
+    "리포트",
+    "수동 진행/자동매매진단",
+])
 
 
 def _mask_env(value: str | None) -> str:
@@ -34,22 +46,50 @@ def _mask_env(value: str | None) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
-def _render_portfolio_snapshot(force_refresh: bool = False) -> None:
-    st.subheader("계좌 요약 / 보유 종목")
+def _show_portfolio(force_refresh: bool = False, include_controls: bool = False) -> None:
+    if include_controls:
+        c1, c2 = st.columns([1, 2])
+        auto_on = c1.checkbox("자동 갱신", value=False, key="portfolio_auto")
+        sec = c2.selectbox("자동 갱신 주기", [15, 30, 60], index=1, key="portfolio_auto_sec")
+        if auto_on and st_autorefresh is not None:
+            st_autorefresh(interval=sec * 1000, key="portfolio_refresh_counter")
+        elif auto_on and st_autorefresh is None:
+            st.warning("자동 갱신 패키지(streamlit-autorefresh)가 없어 수동 갱신만 가능합니다.")
+
+    if st.button("포트폴리오 수동 갱신", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}"):
+        force_refresh = True
+
     try:
         snap = engine.get_portfolio_snapshot(force_refresh=force_refresh)
-        summary = snap["account"]
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("주문가능현금", f"{summary.get('available_cash', 0):,.0f}원")
-        c2.metric("예수금", f"{summary.get('cash', 0):,.0f}원")
-        c3.metric("D+2 예수금", f"{summary.get('d2_deposit', 0):,.0f}원")
-        c4.metric("총평가", f"{summary.get('total_eval', 0):,.0f}원")
-        c5.metric("총자산", f"{summary.get('total_asset', 0):,.0f}원")
-        positions = pd.DataFrame(snap["positions"])
-        st.dataframe(positions, use_container_width=True)
+        account = snap["account"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("주문가능금액", f"{account.get('available_cash', 0):,.0f}원")
+        c2.metric("D+2 예수금", f"{account.get('d2_deposit', 0):,.0f}원")
+        c3.metric("총 평가금액", f"{account.get('total_eval', 0):,.0f}원")
+        total_pnl = float(account.get("raw_summary", {}).get("evlu_pfls_smtl_amt", 0) or 0)
+        total_ret = float(account.get("raw_summary", {}).get("evlu_pfls_rt", 0) or 0)
+        c4.metric("총 손익/수익률", f"{total_pnl:,.0f}원 / {total_ret:.2f}%")
+
+        st.caption(f"마지막 갱신: {snap.get('ts', '-')}")
+
+        st.markdown("#### 보유종목")
+        positions = pd.DataFrame(snap.get("positions", []))
+        if positions.empty:
+            st.info("보유 종목 없음")
+        else:
+            st.dataframe(positions, use_container_width=True)
+
+        st.markdown("#### 주문/체결(최근 N건)")
+        orders = pd.DataFrame(snap.get("orders", []))
+        if orders.empty:
+            st.info("주문/체결 내역 없음")
+        else:
+            st.dataframe(orders, use_container_width=True)
+
     except Exception as exc:
         err_type, message, detail = unwrap_exception(exc)
-        st.error(f"잔고 조회 실패 [{err_type}]: {message}")
+        st.error(f"포트폴리오 조회 실패 [{err_type}]: {message}")
         if detail:
             st.json(detail)
 
@@ -59,10 +99,7 @@ with tab1:
     st.subheader("장 상태")
     st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
 
-    if st.button("계좌 새로고침", key="refresh_account_tab1"):
-        _render_portfolio_snapshot(force_refresh=True)
-    else:
-        _render_portfolio_snapshot()
+    _show_portfolio(force_refresh=False, include_controls=False)
 
     signals = db.fetch_df("SELECT created_at, symbol, total_score, stage_scores, pass_fail, reason FROM signals ORDER BY id DESC LIMIT 50")
     if not signals.empty:
@@ -70,11 +107,11 @@ with tab1:
     st.subheader("최근 종목 점수/근거")
     st.dataframe(signals, use_container_width=True)
 
-    open_trades = db.fetch_df("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC")
-    st.subheader("보유 포지션(엔진 내부)")
-    st.dataframe(open_trades, use_container_width=True)
-
 with tab2:
+    st.subheader("포트폴리오")
+    _show_portfolio(force_refresh=False, include_controls=True)
+
+with tab3:
     st.subheader("단계별 돌파 전략 파라미터")
     cfg = cfg_mgr.load()
     mode = st.selectbox("매매 모드", ["DRY-RUN", "LIVE"], index=0 if cfg["mode"] == "DRY-RUN" else 1)
@@ -85,46 +122,25 @@ with tab2:
     for key, val in cfg["risk_limits"].items():
         cfg["risk_limits"][key] = st.number_input(f"risk_limits.{key}", value=float(val), key=f"risk_{key}")
 
-    for stage_name, stage_cfg in cfg["stages"].items():
-        with st.expander(f"{stage_name}", expanded=False):
-            for key, val in list(stage_cfg.items()):
-                if isinstance(val, bool):
-                    stage_cfg[key] = st.checkbox(f"{stage_name}.{key}", value=val, key=f"{stage_name}_{key}")
-                elif isinstance(val, (int, float)):
-                    stage_cfg[key] = st.number_input(f"{stage_name}.{key}", value=float(val), key=f"{stage_name}_{key}")
-                elif isinstance(val, list):
-                    stage_cfg[key] = st.text_input(f"{stage_name}.{key} (comma)", value=",".join(map(str, val)), key=f"{stage_name}_{key}").split(",")
-                elif isinstance(val, dict):
-                    st.caption(f"{stage_name}.{key}: 유료 동일값 입력칸")
-                    for sk, sv in val.items():
-                        if isinstance(sv, bool):
-                            val[sk] = st.checkbox(f"{stage_name}.{key}.{sk}", value=sv, key=f"{stage_name}_{key}_{sk}")
-                        else:
-                            val[sk] = st.text_input(f"{stage_name}.{key}.{sk}", value="" if sv is None else str(sv), key=f"{stage_name}_{key}_{sk}")
-                else:
-                    stage_cfg[key] = st.text_input(f"{stage_name}.{key}", value=str(val), key=f"{stage_name}_{key}")
+    st.markdown("#### 뉴스 후보 설정")
+    for key, val in cfg.get("news", {}).items():
+        if isinstance(val, bool):
+            cfg["news"][key] = st.checkbox(f"news.{key}", value=val, key=f"news_{key}")
+        elif isinstance(val, (int, float)):
+            cfg["news"][key] = st.number_input(f"news.{key}", value=float(val), key=f"news_{key}")
+        else:
+            cfg["news"][key] = st.text_input(f"news.{key}", value=str(val), key=f"news_{key}")
 
     if st.button("전략 저장(핫리로드)"):
-        for stage in cfg["stages"].values():
-            for k, v in stage.items():
-                if isinstance(v, list):
-                    converted = []
-                    for x in v:
-                        try:
-                            converted.append(float(x))
-                        except ValueError:
-                            converted.append(x)
-                    stage[k] = converted
         cfg_mgr.save(cfg)
-        st.success("저장 완료. 엔진은 다음 tick에서 자동 반영됩니다.")
-
-with tab3:
-    st.subheader("환경변수(.env) 기반 시크릿 상태")
-    st.info("보안 정보는 UI 저장 없이 .env/시스템 환경변수에서만 로드됩니다.")
-    env_keys = ["KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT_NO", "KAKAO_TOKEN", "AUTOTRADE_MASTER_PASSPHRASE"]
-    st.table({"key": env_keys, "value(masked)": [_mask_env(os.getenv(k)) for k in env_keys]})
+        st.success("저장 완료")
 
 with tab4:
+    st.subheader("환경변수(.env) 기반 시크릿 상태")
+    env_keys = ["KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT_NO", "KAKAO_TOKEN", "NEWS_API_KEY"]
+    st.table({"key": env_keys, "value(masked)": [_mask_env(os.getenv(k)) for k in env_keys]})
+
+with tab5:
     st.subheader("성과 리포트")
     df = load_closed_trades(db)
     period_map = {"일별": "D", "월별": "M", "분기별": "Q", "연도별": "Y"}
@@ -135,58 +151,63 @@ with tab4:
         agg = aggregate_performance(df, period_map[period_name])
         st.dataframe(agg, use_container_width=True)
         contrib = symbol_contribution(df)
-        st.subheader("종목별 기여도")
         st.dataframe(contrib, use_container_width=True)
         csv_buf = StringIO()
         agg.to_csv(csv_buf, index=False)
         st.download_button("CSV 다운로드", data=csv_buf.getvalue(), file_name="performance_report.csv", mime="text/csv")
 
-with tab5:
-    st.subheader("수동 진행 기능")
-    if st.button("계좌 새로고침", key="refresh_account_tab5"):
-        _render_portfolio_snapshot(force_refresh=True)
-    else:
-        _render_portfolio_snapshot()
+with tab6:
+    st.subheader("우량주 후보")
+    news_status = engine.get_news_status()
+    st.write(
+        {
+            "provider": news_status.get("provider"),
+            "use_news_universe": news_status.get("use_news_universe"),
+            "today_calls": news_status.get("state", {}).get("today_calls"),
+            "next_update_at": news_status.get("state", {}).get("next_update_at"),
+            "blocker": news_status.get("state", {}).get("blocker"),
+            "candidate_count": news_status.get("candidate_count"),
+        }
+    )
 
-    st.markdown("### 자동매수 후보 TOP N")
-    top_n = st.slider("후보 개수", min_value=3, max_value=20, value=10)
-    if st.button("후보 새로고침"):
+    c1, c2 = st.columns([1, 1])
+    auto_news = c1.checkbox("뉴스 자동갱신 ON", value=False, key="news_auto")
+    auto_min = c2.selectbox("뉴스 자동갱신 주기(분)", [10, 30, 60], index=1, key="news_auto_min")
+    if auto_news and st_autorefresh is not None:
+        st_autorefresh(interval=auto_min * 60 * 1000, key="news_refresh_counter")
         try:
-            st.session_state["candidate_preview"] = engine.get_buy_candidates_preview(top_n=top_n)
+            engine.refresh_news_candidates(force=False)
         except Exception as exc:
             err_type, message, detail = unwrap_exception(exc)
-            st.error(f"후보 조회 실패 [{err_type}]: {message}")
+            st.error(f"자동 뉴스 갱신 실패 [{err_type}]: {message}")
             if detail:
                 st.json(detail)
 
-    if "candidate_preview" in st.session_state:
-        show_unaffordable = st.checkbox("구매불가 후보도 보기", value=False)
-        df_cand = pd.DataFrame(st.session_state["candidate_preview"])
-        if not show_unaffordable and not df_cand.empty and "affordable" in df_cand.columns:
-            df_cand = df_cand[df_cand["affordable"] == True]
-        st.dataframe(df_cand, use_container_width=True)
+    if st.button("지금 우량주 검색"):
+        try:
+            result = engine.refresh_news_candidates(force=True)
+            st.success(f"후보 갱신 완료: {result}")
+        except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
+            st.error(f"뉴스 갱신 실패 [{err_type}]: {message}")
+            if detail:
+                st.json(detail)
 
-    if st.button("1) 수동 진단 실행", use_container_width=True):
-        diag = engine.run_manual_diagnosis()
-        st.session_state["manual_diag"] = diag
-
-    if "manual_diag" in st.session_state:
-        diag = st.session_state["manual_diag"]
-        st.markdown(f"- {'✅' if diag['market'].can_place_order else '❌'} **시장 단계**: {diag['market'].reason}")
-        st.markdown(f"- {'✅' if diag['risk_ok'] else '❌'} **리스크 단계**: {diag['risk_reason']}")
-        st.markdown(f"- {'✅' if diag['env_reason'] == '정상' else '❌'} **환경변수 단계**: {diag['env_reason']}")
-
-        if diag["error"]:
-            st.error(f"시세/전략 진단 실패 [{diag.get('error_type')}]: {diag['error']}")
-            if diag.get("error_detail"):
-                st.json(diag["error_detail"])
-
-        if diag["rows"]:
-            df_diag = pd.DataFrame(diag["rows"])
-            st.dataframe(df_diag, use_container_width=True)
+    try:
+        preview = engine.get_buy_candidates_preview(top_n=20)
+        show_unaffordable = st.checkbox("구매불가 후보 보기", value=True)
+        df_prev = pd.DataFrame(preview)
+        if not show_unaffordable and not df_prev.empty and "affordable" in df_prev.columns:
+            df_prev = df_prev[df_prev["affordable"] == True]
+        st.dataframe(df_prev, use_container_width=True)
+    except Exception as exc:
+        err_type, message, detail = unwrap_exception(exc)
+        st.error(f"후보 조회 실패 [{err_type}]: {message}")
+        if detail:
+            st.json(detail)
 
     st.divider()
-    st.subheader("2) 수동 주문 테스트")
+    st.subheader("수동 주문 테스트")
     with st.form("manual_order_form"):
         symbol = st.text_input("종목코드", value="005930")
         side = st.selectbox("매수/매도", ["BUY", "SELL"])

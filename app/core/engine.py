@@ -14,6 +14,8 @@ from app.core.market_hours import get_market_status
 from app.core.strategy import ScoreResult, StageStrategy
 from app.services.kakao import KakaoNotifier
 from app.services.kis_client import KISClient, KISError, Quote
+from app.services.news_client import NewsClient
+from app.services.portfolio_service import PortfolioService
 from app.utils.errors import unwrap_exception
 
 logger = logging.getLogger(__name__)
@@ -38,12 +40,15 @@ class AutoTradingEngine:
         self.db = db
         self.runtime = EngineRuntime()
         self.notifier = notifier
+        self.portfolio_service = PortfolioService()
+        self.news_client: NewsClient | None = None
         self._reload_config()
 
     def _reload_config(self) -> None:
         self.config = self.cfg_mgr.load()
         self.strategy = StageStrategy(self.config)
         self.kis = KISClient(dry_run=self.config.get("mode", "DRY-RUN") == "DRY-RUN")
+        self.news_client = NewsClient(self.config)
 
     def enable(self, is_on: bool) -> None:
         self.runtime.enabled = is_on
@@ -77,8 +82,17 @@ class AutoTradingEngine:
             return
 
         try:
-            quotes = self.kis.fetch_universe_quotes()
-            candidates = self.build_candidates(quotes)
+            if self.config.get("news", {}).get("use_news_universe", False) and self.news_client is not None:
+                self.news_client.update_candidates(force=False)
+                news_candidates = self.news_client.load_candidates()
+                symbols = [x.get("symbol", "") for x in news_candidates if x.get("symbol")]
+                quotes = self.kis.fetch_universe_quotes(symbols=symbols)
+                score_map = {x.get("symbol"): float(x.get("score", 0)) for x in news_candidates}
+            else:
+                quotes = self.kis.fetch_universe_quotes()
+                score_map = {}
+
+            candidates = self.build_candidates(quotes, external_score_map=score_map)
 
             for c in candidates:
                 self.db.insert_signal(
@@ -129,7 +143,7 @@ class AutoTradingEngine:
 
         return True, "정상"
 
-    def build_candidates(self, quotes: list[Quote]) -> list[dict[str, Any]]:
+    def build_candidates(self, quotes: list[Quote], external_score_map: dict[str, float] | None = None) -> list[dict[str, Any]]:
         universe = self.config.get("stages", {}).get("universe", {})
         use_allowlist = bool(universe.get("use_allowlist", False))
         allowlist_symbols = set(universe.get("allowlist_symbols", []) or [])
@@ -146,22 +160,28 @@ class AutoTradingEngine:
                     stage_checks=result.stage_checks,
                 )
 
+            ext_score = (external_score_map or {}).get(q.symbol, 0.0)
+            total_score = result.total_score + ext_score
+
             row: dict[str, Any] = {
                 "symbol": q.symbol,
                 "price": q.price,
-                "total_score": result.total_score,
+                "total_score": total_score,
                 "pass_fail": "PASS" if result.passed else "FAIL",
                 "reason": result.reason,
                 "stage_scores": result.stage_scores,
                 "stage_checks": result.stage_checks,
                 "strategy_pass": result.passed,
+                "news_score": ext_score,
             }
             rows.append(row)
 
-        rows.sort(key=lambda x: (x["total_score"], -x.get("stage_scores", {}).get("universe", 0), x.get("price", 0)), reverse=True)
+        rows.sort(key=lambda x: (x["total_score"], x.get("news_score", 0), -x.get("price", 0)), reverse=True)
         return rows
 
     def get_buy_candidates_preview(self, top_n: int = 10) -> list[dict[str, Any]]:
+        self.portfolio_service = PortfolioService()
+        self.news_client: NewsClient | None = None
         self._reload_config()
         quotes = self.kis.fetch_universe_quotes()
         candidates = self.build_candidates(quotes)
@@ -174,7 +194,7 @@ class AutoTradingEngine:
 
         out: list[dict[str, Any]] = []
         for c in candidates[:top_n]:
-            qty = 1
+            qty = self.determine_order_qty(c["price"], available_cash)
             ok, affordability_reason, detail = self.check_affordability(c["price"], qty, available_cash)
             affordable = c["strategy_pass"] and ok
             skip_reason = ""
@@ -204,6 +224,21 @@ class AutoTradingEngine:
         estimated_fees = max(0.0, price * qty * 0.00015)
         return price * qty + estimated_fees
 
+    def determine_order_qty(self, price: float, available_cash: float) -> int:
+        if price <= 0:
+            return 0
+        max_buy = self._max_buy_per_trade()
+        budget = min(available_cash, max_buy if max_buy > 0 else available_cash)
+        qty = int(budget // price)
+        if qty < 1:
+            return 1
+        while qty > 0:
+            cost = self._estimate_cost(price, qty)
+            if cost <= available_cash and (max_buy <= 0 or cost <= max_buy):
+                return qty
+            qty -= 1
+        return 1
+
     def check_affordability(self, price: float, qty: int, available_cash: float) -> tuple[bool, str, dict[str, Any]]:
         max_buy = self._max_buy_per_trade()
         estimated_cost = self._estimate_cost(price, qty)
@@ -229,7 +264,7 @@ class AutoTradingEngine:
                 continue
             if c["symbol"] in self.runtime.open_positions:
                 continue
-            qty = 1
+            qty = self.determine_order_qty(c["price"], available_cash)
             ok, reason, detail = self.check_affordability(c["price"], qty, available_cash)
             if not ok:
                 reason_detail = {"symbol": c["symbol"], **detail}
@@ -266,8 +301,17 @@ class AutoTradingEngine:
 
         rows: list[dict[str, Any]] = []
         try:
-            quotes = self.kis.fetch_universe_quotes()
-            candidates = self.build_candidates(quotes)
+            if self.config.get("news", {}).get("use_news_universe", False) and self.news_client is not None:
+                self.news_client.update_candidates(force=False)
+                news_candidates = self.news_client.load_candidates()
+                symbols = [x.get("symbol", "") for x in news_candidates if x.get("symbol")]
+                quotes = self.kis.fetch_universe_quotes(symbols=symbols)
+                score_map = {x.get("symbol"): float(x.get("score", 0)) for x in news_candidates}
+                candidates = self.build_candidates(quotes, external_score_map=score_map)
+            else:
+                quotes = self.kis.fetch_universe_quotes()
+                candidates = self.build_candidates(quotes)
+
             for c in candidates:
                 row: dict[str, Any] = {
                     "symbol": c["symbol"],
@@ -321,6 +365,8 @@ class AutoTradingEngine:
         }
 
     def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
+        self.portfolio_service = PortfolioService()
+        self.news_client: NewsClient | None = None
         self._reload_config()
         ttl = int(os.getenv("PORTFOLIO_CACHE_SECONDS", "20"))
         now = time.time()
@@ -334,7 +380,29 @@ class AutoTradingEngine:
         self.runtime.portfolio_cache_ts = now
         return snap
 
+    def get_news_status(self) -> dict[str, Any]:
+        self._reload_config()
+        if self.news_client is None:
+            return {"enabled": False}
+        state = self.news_client.load_state()
+        candidates = self.news_client.load_candidates()
+        return {
+            "enabled": True,
+            "provider": self.news_client.cfg.mode,
+            "state": state,
+            "candidate_count": len(candidates),
+            "use_news_universe": bool(self.config.get("news", {}).get("use_news_universe", False)),
+        }
+
+    def refresh_news_candidates(self, force: bool = True) -> dict[str, Any]:
+        self._reload_config()
+        if self.news_client is None:
+            return {"updated": False, "reason": "NEWS_CLIENT_DISABLED"}
+        return self.news_client.update_candidates(force=force)
+
     def precheck_manual_buy(self, price: float, qty: int) -> dict[str, Any]:
+        self.portfolio_service = PortfolioService()
+        self.news_client: NewsClient | None = None
         self._reload_config()
         account = self.kis.fetch_account_summary()
         available_cash = float(account.get("available_cash", 0) or 0)
@@ -342,6 +410,8 @@ class AutoTradingEngine:
         return {"ok": ok, "reason": reason, **detail}
 
     def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
+        self.portfolio_service = PortfolioService()
+        self.news_client: NewsClient | None = None
         self._reload_config()
         order = self.kis.place_order(symbol=symbol, qty=qty, side=side, price=price)
         logger.info("manual order result=%s", order)

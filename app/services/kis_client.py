@@ -102,14 +102,15 @@ class KISClient:
 
         self._token: str | None = None
         self._token_expire_at: datetime | None = None
+        self._token_retry_after_epoch: float = 0.0
 
     @retry(
         retry=retry_if_exception_type(KISError),
         wait=wait_exponential(multiplier=1, min=1, max=8),
         stop=stop_after_attempt(3),
     )
-    def fetch_universe_quotes(self) -> list[Quote]:
-        symbols = os.getenv("KIS_SYMBOLS", "005930,000660,035420,251270,068270,207940").split(",")
+    def fetch_universe_quotes(self, symbols: list[str] | None = None) -> list[Quote]:
+        symbols = symbols or os.getenv("KIS_SYMBOLS", "005930,000660,035420,251270,068270,207940").split(",")
         symbols = [s.strip() for s in symbols if s.strip()]
         if self.dry_run:
             return self._simulated_quotes(symbols)
@@ -333,8 +334,12 @@ class KISClient:
         }
 
     def _get_access_token(self) -> str:
+        now_epoch = datetime.utcnow().timestamp()
         if self._token and self._token_expire_at and datetime.utcnow() < self._token_expire_at:
             return self._token
+        if now_epoch < self._token_retry_after_epoch:
+            retry_at = datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()
+            raise KISError("KIS token cooldown active", detail={"next_retry_at": retry_at})
 
         url = f"{self.base_url}/oauth2/tokenP"
         payload = {"grant_type": "client_credentials", "appkey": self.appkey, "appsecret": self.appsecret}
@@ -343,13 +348,15 @@ class KISClient:
         try:
             resp = requests.post(url, headers={"content-type": "application/json"}, json=payload, timeout=self.timeout)
         except Exception as exc:
-            raise KISError("KIS token request failed", detail={"url": url, "error": str(exc)}) from exc
+            self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
+            raise KISError("KIS token request failed", detail={"url": url, "error": str(exc), "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()}) from exc
 
         data = self._safe_json(resp)
         if resp.status_code != 200 or "access_token" not in data:
+            self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
             raise KISError(
                 "KIS token failed",
-                detail={"http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": data.get("msg1"), "url": url, "raw_response": data},
+                detail={"http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": data.get("msg1"), "url": url, "raw_response": data, "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()},
             )
 
         self._token = data["access_token"]
@@ -534,6 +541,47 @@ class KISClient:
                 }
             )
         return rows
+
+    def fetch_recent_orders(self, limit: int = 20) -> list[dict[str, Any]]:
+        if self.dry_run:
+            return [
+                {"symbol": "005930", "side": "BUY", "qty": 1, "price": 70000, "status": "MOCK", "order_time": datetime.utcnow().isoformat()}
+            ]
+
+        cano, acnt_prdt_cd = self._split_account_no()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        headers = self._auth_headers("TTTC8001R")
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "INQR_STRT_DT": datetime.utcnow().strftime("%Y%m%d"),
+            "INQR_END_DT": datetime.utcnow().strftime("%Y%m%d"),
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "00",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        data = self._request_json("GET", url, headers=headers, params=params)
+        rows = data.get("output1", []) if isinstance(data.get("output1"), list) else []
+        out = []
+        for r in rows[:limit]:
+            out.append(
+                {
+                    "symbol": r.get("pdno", ""),
+                    "side": "BUY" if r.get("sll_buy_dvsn_cd") == "02" else "SELL",
+                    "qty": int(float(r.get("ord_qty", 0) or 0)),
+                    "price": float(r.get("ord_unpr", 0) or 0),
+                    "status": r.get("ord_gno_brno", ""),
+                    "order_time": r.get("ord_dt", ""),
+                }
+            )
+        return out
 
     def _request_json(self, method: str, url: str, headers: dict[str, str], params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if requests is None:

@@ -170,3 +170,26 @@ curl http://127.0.0.1:8000/health
 - `자동매수 후보 TOP N`에서 affordable=false 후보가 기본 숨김인지, 토글로 확인 가능한지
 - 수동 BUY 주문 시 사전검증에서 `INSUFFICIENT_CASH`/`MAX_BUY_EXCEEDED`가 구조화 메시지로 보이는지
 - LIVE에서 잔고 조회 실패 시 `status/rt_cd/msg1/raw`가 UI에 표시되는지
+
+
+## 12) 포트폴리오 탭 / 우량주 후보 탭 사용법
+
+- `포트폴리오` 탭
+  - 계좌 요약 카드: 주문가능금액, D+2 예수금, 총평가금액, 총손익/수익률
+  - 보유종목 테이블: symbol/qty/avg_price/eval_price/pnl/pnl_pct
+  - 주문/체결 최근 N건 표시
+  - 자동갱신 ON/OFF(15~60초) + 수동 갱신 버튼
+  - 오류 시 `status/rt_cd/msg1/next_retry_at/raw` 구조화 표시
+
+- `수동 진행/자동매매진단` 탭 > 우량주 후보
+  - 자동 주기 갱신(기본 30분) 또는 `지금 우량주 검색` 버튼
+  - 호출 제한 초과 시 blocker 표시
+  - 후보 테이블: symbol/score/price/estimated_cost/affordable/skip_reason
+  - `use_news_universe` 활성화 시 엔진이 후보 리스트를 universe로 사용
+
+## 13) 뉴스 후보 데이터 저장 파일
+
+- `data/candidates.json`: 우량주 후보 공유 파일(UI/엔진 공용)
+- `data/news_state.json`: 호출 횟수/비용 cap/다음 갱신 시간 상태
+- `data/portfolio_snapshot.json`: 포트폴리오 단기 캐시
+- 파일 쓰기는 임시파일 후 rename(atomic write) 방식으로 처리
