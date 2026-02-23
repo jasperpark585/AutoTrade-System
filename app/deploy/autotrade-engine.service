@@ -1,0 +1,18 @@
+[Unit]
+Description=AutoTrade Engine Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/AutoTrade-System
+Environment="TZ=Asia/Seoul"
+EnvironmentFile=/opt/AutoTrade-System/.env
+ExecStart=/opt/AutoTrade-System/.venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/AutoTrade-System/logs/engine.out.log
+StandardError=append:/opt/AutoTrade-System/logs/engine.err.log
+
+[Install]
+WantedBy=multi-user.target
