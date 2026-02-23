@@ -13,6 +13,7 @@ from app.core.engine import AutoTradingEngine
 from app.core.market_hours import get_market_status
 from app.core.reporting import aggregate_performance, load_closed_trades, symbol_contribution
 from app.services.kakao import KakaoNotifier
+from app.utils.errors import unwrap_exception
 
 st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
 
@@ -31,6 +32,7 @@ def _mask_env(value: str | None) -> str:
     if len(value) <= 4:
         return "*" * len(value)
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
 
 
 with tab1:
@@ -97,17 +99,6 @@ with tab3:
     st.info("보안 정보는 UI 저장 없이 .env/시스템 환경변수에서만 로드됩니다.")
     env_keys = ["KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT_NO", "KAKAO_TOKEN", "AUTOTRADE_MASTER_PASSPHRASE"]
     st.table({"key": env_keys, "value(masked)": [_mask_env(os.getenv(k)) for k in env_keys]})
-    st.code(
-        """# .env 예시
-KIS_APPKEY=...
-KIS_APPSECRET=...
-KIS_ACCOUNT_NO=12345678-01
-KAKAO_TOKEN=...
-AUTOTRADE_EQUITY_BASE_KRW=30000000
-KIS_MOCK_ORDER=false
-""",
-        language="bash",
-    )
 
 with tab4:
     st.subheader("성과 리포트")
@@ -119,51 +110,34 @@ with tab4:
     else:
         agg = aggregate_performance(df, period_map[period_name])
         st.dataframe(agg, use_container_width=True)
-
         contrib = symbol_contribution(df)
         st.subheader("종목별 기여도")
         st.dataframe(contrib, use_container_width=True)
-
         csv_buf = StringIO()
         agg.to_csv(csv_buf, index=False)
         st.download_button("CSV 다운로드", data=csv_buf.getvalue(), file_name="performance_report.csv", mime="text/csv")
 
 with tab5:
     st.subheader("수동 진행 기능")
-    st.caption("자동매매가 멈춘 경우 어떤 단계에서 막혔는지 즉시 확인하고, 수동 주문 테스트를 진행할 수 있습니다.")
-
-    col1, col2, col3 = st.columns(3)
-    if col1.button("1) 수동 진단 실행", use_container_width=True):
+    if st.button("1) 수동 진단 실행", use_container_width=True):
         diag = engine.run_manual_diagnosis()
         st.session_state["manual_diag"] = diag
 
     if "manual_diag" in st.session_state:
         diag = st.session_state["manual_diag"]
-        market_icon = "✅" if diag["market"].can_place_order else "❌"
-        risk_icon = "✅" if diag["risk_ok"] else "❌"
-        env_icon = "✅" if diag["env_reason"] == "정상" else "❌"
-
-        st.markdown(f"- {market_icon} **시장 단계**: {diag['market'].reason}")
-        st.markdown(f"- {risk_icon} **리스크 단계**: {diag['risk_reason']}")
-        st.markdown(f"- {env_icon} **환경변수 단계**: {diag['env_reason']}")
+        st.markdown(f"- {'✅' if diag['market'].can_place_order else '❌'} **시장 단계**: {diag['market'].reason}")
+        st.markdown(f"- {'✅' if diag['risk_ok'] else '❌'} **리스크 단계**: {diag['risk_reason']}")
+        st.markdown(f"- {'✅' if diag['env_reason'] == '정상' else '❌'} **환경변수 단계**: {diag['env_reason']}")
 
         if diag["error"]:
-            st.error(f"시세/전략 진단 중 오류: {diag['error']}")
+            st.error(f"시세/전략 진단 실패 [{diag.get('error_type')}]: {diag['error']}")
 
         if diag["rows"]:
             df_diag = pd.DataFrame(diag["rows"])
-            st.subheader("2) 종목별 단계 통과/실패 현황")
             st.dataframe(df_diag, use_container_width=True)
-            blocked = df_diag[df_diag["can_auto_order_now"] == False]
-            if not blocked.empty:
-                st.warning("자동매매 불가 종목이 있습니다. blocker 컬럼으로 원인을 즉시 확인하세요.")
-            else:
-                st.success("현재 기준 자동매매 진행 가능한 후보가 있습니다.")
 
     st.divider()
-    st.subheader("3) 수동 주문 테스트")
-    st.warning("실계좌 보호를 위해 LIVE 모드에서는 소량/모의환경(KIS_MOCK_ORDER=true)으로 먼저 테스트하세요.")
-
+    st.subheader("2) 수동 주문 테스트")
     with st.form("manual_order_form"):
         symbol = st.text_input("종목코드", value="005930")
         side = st.selectbox("매수/매도", ["BUY", "SELL"])
@@ -177,4 +151,7 @@ with tab5:
             st.success("수동 주문 요청 완료")
             st.json(result)
         except Exception as exc:
-            st.error(f"수동 주문 실패: {exc}")
+            err_type, message, detail = unwrap_exception(exc)
+            st.error(f"수동 주문 실패 [{err_type}]: {message}")
+            if detail:
+                st.json(detail)

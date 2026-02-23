@@ -14,6 +14,7 @@ from app.core.market_hours import get_market_status
 from app.core.strategy import StageStrategy
 from app.services.kakao import KakaoNotifier
 from app.services.kis_client import KISClient
+from app.utils.errors import unwrap_exception
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +90,16 @@ class AutoTradingEngine:
 
             self._manage_positions(quotes)
         except Exception as exc:
-            self.runtime.fatal_error = str(exc)
+            formatted = self.format_exception(exc)
+            self.runtime.fatal_error = formatted
             self.runtime.enabled = False
-            self.notifier.send(f"[치명오류] 자동매매 중지: {exc}")
-            logger.exception("Fatal engine error")
+            self.notifier.send(f"[치명오류] 자동매매 중지: {formatted[:280]}")
+            logger.exception("Fatal engine error: %s", formatted)
+
+    @staticmethod
+    def format_exception(exc: Exception) -> str:
+        err_type, message, _ = unwrap_exception(exc)
+        return f"{err_type}: {message}"
 
     def risk_check_detail(self) -> tuple[bool, str]:
         risk = self.config["risk_limits"]
@@ -119,7 +126,6 @@ class AutoTradingEngine:
         return True, "정상"
 
     def run_manual_diagnosis(self) -> dict[str, Any]:
-        """Manual check: identify blockers and stage-by-stage pass/fail per symbol."""
         self._reload_config()
         market = get_market_status()
         risk_ok, risk_reason = self.risk_check_detail()
@@ -131,10 +137,9 @@ class AutoTradingEngine:
             "kis_account_no": bool(os.getenv("KIS_ACCOUNT_NO")),
         }
 
+        env_reason = "정상"
         if env_check["mode"] == "LIVE" and not all([env_check["kis_appkey"], env_check["kis_appsecret"], env_check["kis_account_no"]]):
             env_reason = "LIVE 필수 환경변수 누락"
-        else:
-            env_reason = "정상"
 
         rows: list[dict[str, Any]] = []
         try:
@@ -173,7 +178,8 @@ class AutoTradingEngine:
                 "risk_reason": risk_reason,
                 "env_check": env_check,
                 "env_reason": env_reason,
-                "error": str(exc),
+                "error": self.format_exception(exc),
+                "error_type": type(exc).__name__,
                 "rows": rows,
             }
 
@@ -184,11 +190,11 @@ class AutoTradingEngine:
             "env_check": env_check,
             "env_reason": env_reason,
             "error": None,
+            "error_type": None,
             "rows": rows,
         }
 
     def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
-        """Manual order endpoint for operator-driven smoke checks from UI."""
         self._reload_config()
         order = self.kis.place_order(symbol=symbol, qty=qty, side=side, price=price)
         logger.info("manual order result=%s", order)
@@ -206,7 +212,7 @@ class AutoTradingEngine:
             return
 
         order = self.kis.place_order(symbol=symbol, qty=qty, side="BUY", price=price)
-        if order.get("status") in {"SIMULATED", "FILLED"}:
+        if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
             trade_id = self.db.open_trade(symbol, qty, price, reason)
             self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": qty}
             self.runtime.daily_trades += 1
@@ -222,7 +228,7 @@ class AutoTradingEngine:
             should_exit = change_pct <= -exit_cfg["stop_loss_pct"] or change_pct >= exit_cfg["take_profit_pct"]
             if should_exit:
                 order = self.kis.place_order(symbol=q.symbol, qty=pos["qty"], side="SELL", price=q.price)
-                if order.get("status") in {"SIMULATED", "FILLED"}:
+                if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
                     self.db.close_trade(pos["trade_id"], q.price, fees=500, reason_exit="auto_exit")
                     pnl = (q.price - pos["entry_price"]) * pos["qty"] - 500
                     self.runtime.daily_loss_krw += min(0, pnl)
