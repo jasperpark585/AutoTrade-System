@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from app.core.config import ConfigManager
 from app.core.database import Database
@@ -13,6 +14,7 @@ from app.core.market_hours import get_market_status
 from app.core.strategy import StageStrategy
 from app.services.kakao import KakaoNotifier
 from app.services.kis_client import KISClient
+from app.utils.errors import unwrap_exception
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +69,9 @@ class AutoTradingEngine:
         if self.runtime.cooldown_until_epoch > time.time():
             return
 
-        if not self._risk_check_passed():
-            logger.warning("Risk limit reached, trading paused.")
+        risk_ok, risk_reason = self.risk_check_detail()
+        if not risk_ok:
+            logger.warning("Risk limit reached, trading paused. %s", risk_reason)
             return
 
         try:
@@ -87,20 +90,26 @@ class AutoTradingEngine:
 
             self._manage_positions(quotes)
         except Exception as exc:
-            self.runtime.fatal_error = str(exc)
+            formatted = self.format_exception(exc)
+            self.runtime.fatal_error = formatted
             self.runtime.enabled = False
-            self.notifier.send(f"[치명오류] 자동매매 중지: {exc}")
-            logger.exception("Fatal engine error")
+            self.notifier.send(f"[치명오류] 자동매매 중지: {formatted[:280]}")
+            logger.exception("Fatal engine error: %s", formatted)
 
-    def _risk_check_passed(self) -> bool:
+    @staticmethod
+    def format_exception(exc: Exception) -> str:
+        err_type, message, _ = unwrap_exception(exc)
+        return f"{err_type}: {message}"
+
+    def risk_check_detail(self) -> tuple[bool, str]:
         risk = self.config["risk_limits"]
         max_orders_per_day = int(risk.get("max_orders_per_day", risk.get("max_daily_trades", 0)))
         if max_orders_per_day > 0 and self.runtime.daily_trades >= max_orders_per_day:
-            return False
+            return False, f"일 주문횟수 제한 도달({self.runtime.daily_trades}/{max_orders_per_day})"
 
         max_daily_loss_krw = float(risk.get("max_daily_loss_krw", 0))
         if max_daily_loss_krw > 0 and self.runtime.daily_loss_krw <= -max_daily_loss_krw:
-            return False
+            return False, f"일 손실한도 초과({self.runtime.daily_loss_krw:,.0f}원)"
 
         max_daily_loss_pct = float(risk.get("max_daily_loss_pct", 0))
         if max_daily_loss_pct > 0:
@@ -108,8 +117,88 @@ class AutoTradingEngine:
             if equity > 0:
                 loss_pct = abs(self.runtime.daily_loss_krw) / equity * 100
                 if loss_pct >= max_daily_loss_pct:
-                    return False
-        return True
+                    return False, f"일 손실률 제한 초과({loss_pct:.2f}%/{max_daily_loss_pct}%)"
+
+        if self.runtime.cooldown_until_epoch > time.time():
+            remain = int(self.runtime.cooldown_until_epoch - time.time())
+            return False, f"연속손실 쿨다운({remain}초 남음)"
+
+        return True, "정상"
+
+    def run_manual_diagnosis(self) -> dict[str, Any]:
+        self._reload_config()
+        market = get_market_status()
+        risk_ok, risk_reason = self.risk_check_detail()
+
+        env_check = {
+            "mode": self.config.get("mode", "DRY-RUN"),
+            "kis_appkey": bool(os.getenv("KIS_APPKEY")),
+            "kis_appsecret": bool(os.getenv("KIS_APPSECRET")),
+            "kis_account_no": bool(os.getenv("KIS_ACCOUNT_NO")),
+        }
+
+        env_reason = "정상"
+        if env_check["mode"] == "LIVE" and not all([env_check["kis_appkey"], env_check["kis_appsecret"], env_check["kis_account_no"]]):
+            env_reason = "LIVE 필수 환경변수 누락"
+
+        rows: list[dict[str, Any]] = []
+        try:
+            quotes = self.kis.fetch_universe_quotes()
+            for q in quotes:
+                result = self.strategy.evaluate(q)
+                row: dict[str, Any] = {
+                    "symbol": q.symbol,
+                    "price": round(q.price, 2),
+                    "total_score": result.total_score,
+                    "strategy_pass": result.passed,
+                    "strategy_reason": result.reason,
+                }
+                for stage, info in result.stage_checks.items():
+                    row[f"{stage}_pass"] = info["passed"]
+                    row[f"{stage}_reason"] = info["reason"]
+                row["can_auto_order_now"] = bool(result.passed and market.can_place_order and risk_ok and env_reason == "정상")
+                if not row["can_auto_order_now"]:
+                    blockers = []
+                    if not result.passed:
+                        blockers.append("전략미통과")
+                    if not market.can_place_order:
+                        blockers.append(f"시장:{market.reason}")
+                    if not risk_ok:
+                        blockers.append(f"리스크:{risk_reason}")
+                    if env_reason != "정상":
+                        blockers.append(env_reason)
+                    row["blocker"] = " | ".join(blockers)
+                else:
+                    row["blocker"] = "없음"
+                rows.append(row)
+        except Exception as exc:
+            return {
+                "market": market,
+                "risk_ok": risk_ok,
+                "risk_reason": risk_reason,
+                "env_check": env_check,
+                "env_reason": env_reason,
+                "error": self.format_exception(exc),
+                "error_type": type(exc).__name__,
+                "rows": rows,
+            }
+
+        return {
+            "market": market,
+            "risk_ok": risk_ok,
+            "risk_reason": risk_reason,
+            "env_check": env_check,
+            "env_reason": env_reason,
+            "error": None,
+            "error_type": None,
+            "rows": rows,
+        }
+
+    def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
+        self._reload_config()
+        order = self.kis.place_order(symbol=symbol, qty=qty, side=side, price=price)
+        logger.info("manual order result=%s", order)
+        return order
 
     def _try_entry(self, symbol: str, price: float, reason: str) -> None:
         if symbol in self.runtime.open_positions:
@@ -123,7 +212,7 @@ class AutoTradingEngine:
             return
 
         order = self.kis.place_order(symbol=symbol, qty=qty, side="BUY", price=price)
-        if order.get("status") in {"SIMULATED", "FILLED"}:
+        if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
             trade_id = self.db.open_trade(symbol, qty, price, reason)
             self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": qty}
             self.runtime.daily_trades += 1
@@ -139,7 +228,7 @@ class AutoTradingEngine:
             should_exit = change_pct <= -exit_cfg["stop_loss_pct"] or change_pct >= exit_cfg["take_profit_pct"]
             if should_exit:
                 order = self.kis.place_order(symbol=q.symbol, qty=pos["qty"], side="SELL", price=q.price)
-                if order.get("status") in {"SIMULATED", "FILLED"}:
+                if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
                     self.db.close_trade(pos["trade_id"], q.price, fees=500, reason_exit="auto_exit")
                     pnl = (q.price - pos["entry_price"]) * pos["qty"] - 500
                     self.runtime.daily_loss_krw += min(0, pnl)

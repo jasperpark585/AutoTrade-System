@@ -98,3 +98,33 @@ curl http://127.0.0.1:8000/health
 python -m unittest tests/test_kis_client.py -v
 python -m compileall app
 ```
+
+## 6) 수동 진행/자동매매 진단 UI
+
+- `수동 진행/자동매매 진단` 탭에서 **1클릭 수동 진단**을 실행하면 아래를 한 화면에서 확인합니다.
+  - 시장 단계(정규장 여부)
+  - 리스크 단계(일 주문수/일 손실한도/쿨다운)
+  - 환경변수 단계(LIVE 필수 키 누락 여부)
+  - 종목별 단계 통과/실패(`universe/pre_breakout/trigger/confirmation`) + `blocker` 원인
+- 같은 탭에서 수동 주문 테스트(BUY/SELL, 수량, 가격) 가능
+- LIVE 테스트는 `KIS_MOCK_ORDER=true`로 먼저 검증 후 실제 주문 전환 권장
+
+
+
+## 7) LIVE 지표 산출 방식(실데이터 기반)
+
+- `fetch_universe_quotes()` LIVE 모드에서는 random 값을 사용하지 않습니다.
+- 산출식:
+  - `price`: 현재가 API(inquire-price)
+  - `spread_pct`: 호가 API(best bid/ask) 기반 `(ask-bid)/mid*100`
+  - `volume_ratio`: 당일 누적거래량 / 최근 N일 평균 거래량 (`KIS_VOLUME_AVG_DAYS`)
+  - `volatility_pct`: `(당일고가-당일저가)/시가*100`
+  - `execution_strength`: KIS 응답 체결강도 필드(`tday_rltv`) 사용
+  - `trend_slope`: 최근 N개 분봉 종가 기울기 (`KIS_TREND_WINDOW`)
+- API 실패/데이터 부족 시 해당 종목은 SKIP(보수적) 처리합니다.
+
+## 8) 실패 사유 확인 방법
+
+- UI 수동주문/수동진단 오류는 `RetryError`를 언랩하여 최종 원인(`KISError`)을 표시합니다.
+- 표시 항목: 예외 타입, 메시지, `status_code`, `rt_cd`, `msg1`, raw 응답 일부.
+- 엔진 fatal 중지 시에도 동일 요약이 로그/알림/heartbeat `fatal_error`에 남습니다.

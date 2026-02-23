@@ -4,21 +4,26 @@ import json
 import os
 from io import StringIO
 
+import pandas as pd
 import streamlit as st
 
 from app.core.config import ConfigManager
 from app.core.database import Database
+from app.core.engine import AutoTradingEngine
 from app.core.market_hours import get_market_status
 from app.core.reporting import aggregate_performance, load_closed_trades, symbol_contribution
+from app.services.kakao import KakaoNotifier
+from app.utils.errors import unwrap_exception
 
 st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
 
 cfg_mgr = ConfigManager()
 db = Database()
+engine = AutoTradingEngine(cfg_mgr, db, KakaoNotifier(token=os.getenv("KAKAO_TOKEN")))
 
 st.title("국내주식 완전자동 매매 시스템")
 
-tab1, tab2, tab3, tab4 = st.tabs(["운영 상태", "전략 설정", "환경변수", "리포트"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["운영 상태", "전략 설정", "환경변수", "리포트", "수동 진행/자동매매 진단"])
 
 
 def _mask_env(value: str | None) -> str:
@@ -27,6 +32,7 @@ def _mask_env(value: str | None) -> str:
     if len(value) <= 4:
         return "*" * len(value)
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
 
 
 with tab1:
@@ -93,17 +99,6 @@ with tab3:
     st.info("보안 정보는 UI 저장 없이 .env/시스템 환경변수에서만 로드됩니다.")
     env_keys = ["KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT_NO", "KAKAO_TOKEN", "AUTOTRADE_MASTER_PASSPHRASE"]
     st.table({"key": env_keys, "value(masked)": [_mask_env(os.getenv(k)) for k in env_keys]})
-    st.code(
-        """# .env 예시
-KIS_APPKEY=...
-KIS_APPSECRET=...
-KIS_ACCOUNT_NO=12345678-01
-KAKAO_TOKEN=...
-AUTOTRADE_EQUITY_BASE_KRW=30000000
-KIS_MOCK_ORDER=false
-""",
-        language="bash",
-    )
 
 with tab4:
     st.subheader("성과 리포트")
@@ -115,11 +110,48 @@ with tab4:
     else:
         agg = aggregate_performance(df, period_map[period_name])
         st.dataframe(agg, use_container_width=True)
-
         contrib = symbol_contribution(df)
         st.subheader("종목별 기여도")
         st.dataframe(contrib, use_container_width=True)
-
         csv_buf = StringIO()
         agg.to_csv(csv_buf, index=False)
         st.download_button("CSV 다운로드", data=csv_buf.getvalue(), file_name="performance_report.csv", mime="text/csv")
+
+with tab5:
+    st.subheader("수동 진행 기능")
+    if st.button("1) 수동 진단 실행", use_container_width=True):
+        diag = engine.run_manual_diagnosis()
+        st.session_state["manual_diag"] = diag
+
+    if "manual_diag" in st.session_state:
+        diag = st.session_state["manual_diag"]
+        st.markdown(f"- {'✅' if diag['market'].can_place_order else '❌'} **시장 단계**: {diag['market'].reason}")
+        st.markdown(f"- {'✅' if diag['risk_ok'] else '❌'} **리스크 단계**: {diag['risk_reason']}")
+        st.markdown(f"- {'✅' if diag['env_reason'] == '정상' else '❌'} **환경변수 단계**: {diag['env_reason']}")
+
+        if diag["error"]:
+            st.error(f"시세/전략 진단 실패 [{diag.get('error_type')}]: {diag['error']}")
+
+        if diag["rows"]:
+            df_diag = pd.DataFrame(diag["rows"])
+            st.dataframe(df_diag, use_container_width=True)
+
+    st.divider()
+    st.subheader("2) 수동 주문 테스트")
+    with st.form("manual_order_form"):
+        symbol = st.text_input("종목코드", value="005930")
+        side = st.selectbox("매수/매도", ["BUY", "SELL"])
+        qty = st.number_input("수량", min_value=1, value=1, step=1)
+        price = st.number_input("주문가격(시장가 테스트는 0)", min_value=0.0, value=70000.0, step=1.0)
+        submit_order = st.form_submit_button("수동 주문 실행")
+
+    if submit_order:
+        try:
+            result = engine.manual_place_order(symbol=symbol, qty=int(qty), side=side, price=float(price))
+            st.success("수동 주문 요청 완료")
+            st.json(result)
+        except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
+            st.error(f"수동 주문 실패 [{err_type}]: {message}")
+            if detail:
+                st.json(detail)
