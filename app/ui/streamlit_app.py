@@ -13,7 +13,6 @@ from app.core.engine import AutoTradingEngine
 from app.core.market_hours import get_market_status
 from app.core.reporting import aggregate_performance, load_closed_trades, symbol_contribution
 from app.services.kakao import KakaoNotifier
-from app.services.kis_client import KISError
 from app.utils.errors import unwrap_exception
 
 st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
@@ -35,11 +34,11 @@ def _mask_env(value: str | None) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
-def _render_portfolio_snapshot() -> None:
+def _render_portfolio_snapshot(force_refresh: bool = False) -> None:
     st.subheader("계좌 요약 / 보유 종목")
     try:
-        snap = engine.get_portfolio_snapshot()
-        summary = snap["summary"]
+        snap = engine.get_portfolio_snapshot(force_refresh=force_refresh)
+        summary = snap["account"]
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("주문가능현금", f"{summary.get('available_cash', 0):,.0f}원")
         c2.metric("예수금", f"{summary.get('cash', 0):,.0f}원")
@@ -60,7 +59,10 @@ with tab1:
     st.subheader("장 상태")
     st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
 
-    _render_portfolio_snapshot()
+    if st.button("계좌 새로고침", key="refresh_account_tab1"):
+        _render_portfolio_snapshot(force_refresh=True)
+    else:
+        _render_portfolio_snapshot()
 
     signals = db.fetch_df("SELECT created_at, symbol, total_score, stage_scores, pass_fail, reason FROM signals ORDER BY id DESC LIMIT 50")
     if not signals.empty:
@@ -141,7 +143,10 @@ with tab4:
 
 with tab5:
     st.subheader("수동 진행 기능")
-    _render_portfolio_snapshot()
+    if st.button("계좌 새로고침", key="refresh_account_tab5"):
+        _render_portfolio_snapshot(force_refresh=True)
+    else:
+        _render_portfolio_snapshot()
 
     st.markdown("### 자동매수 후보 TOP N")
     top_n = st.slider("후보 개수", min_value=3, max_value=20, value=10)
@@ -155,7 +160,11 @@ with tab5:
                 st.json(detail)
 
     if "candidate_preview" in st.session_state:
-        st.dataframe(pd.DataFrame(st.session_state["candidate_preview"]), use_container_width=True)
+        show_unaffordable = st.checkbox("구매불가 후보도 보기", value=False)
+        df_cand = pd.DataFrame(st.session_state["candidate_preview"])
+        if not show_unaffordable and not df_cand.empty and "affordable" in df_cand.columns:
+            df_cand = df_cand[df_cand["affordable"] == True]
+        st.dataframe(df_cand, use_container_width=True)
 
     if st.button("1) 수동 진단 실행", use_container_width=True):
         diag = engine.run_manual_diagnosis()
@@ -187,6 +196,12 @@ with tab5:
 
     if submit_order:
         try:
+            if side == "BUY":
+                precheck = engine.precheck_manual_buy(price=float(price), qty=int(qty))
+                if not precheck["ok"]:
+                    st.error(f"수동 주문 사전검증 실패: {precheck['reason']}")
+                    st.json(precheck)
+                    st.stop()
             result = engine.manual_place_order(symbol=symbol, qty=int(qty), side=side, price=float(price))
             st.success("수동 주문 요청 완료")
             st.json(result)

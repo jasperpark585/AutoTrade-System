@@ -436,14 +436,23 @@ class KISClient:
         return output2[:count]
 
 
+
+    def fetch_account_summary(self) -> dict[str, Any]:
+        return self.get_account_summary()
+
+    def fetch_positions(self) -> list[dict[str, Any]]:
+        return self.get_positions()
+
     def get_account_summary(self) -> dict[str, Any]:
         if self.dry_run:
+            equity = float(os.getenv("AUTOTRADE_EQUITY_BASE_KRW", "10000000"))
             return {
-                "available_cash": 10_000_000.0,
-                "cash": 10_000_000.0,
-                "d2_deposit": 10_000_000.0,
+                "available_cash": equity,
+                "cash": equity,
+                "d2_deposit": equity,
                 "total_eval": 0.0,
-                "total_asset": 10_000_000.0,
+                "total_asset": equity,
+                "mode": "DRY-RUN",
             }
 
         cano, acnt_prdt_cd = self._split_account_no()
@@ -483,7 +492,9 @@ class KISClient:
 
     def get_positions(self) -> list[dict[str, Any]]:
         if self.dry_run:
-            return []
+            return [
+                {"symbol": "005930", "name": "삼성전자", "qty": 5, "avg_price": 70000.0, "eval_price": 71000.0, "eval_amount": 355000.0, "pnl": 5000.0, "pnl_pct": 1.43}
+            ]
 
         cano, acnt_prdt_cd = self._split_account_no()
         url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -516,6 +527,7 @@ class KISClient:
                     "name": item.get("prdt_name", ""),
                     "qty": qty,
                     "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
+                    "eval_price": float(item.get("prpr", 0) or item.get("stck_prpr", 0) or 0),
                     "eval_amount": float(item.get("evlu_amt", 0) or 0),
                     "pnl": float(item.get("evlu_pfls_amt", 0) or 0),
                     "pnl_pct": float(item.get("evlu_pfls_rt", 0) or 0),

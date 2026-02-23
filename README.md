@@ -148,3 +148,25 @@ python -m compileall app
   - `estimated_cost > max_buy_amount_per_trade_krw`
 - 로그에 `blocker=INSUFFICIENT_CASH`와 상세 정보(symbol/price/qty/estimated_cost/available_cash)가 기록됩니다.
 - 토큰/서버 장애 등 API_ERROR 계열은 후보를 바꿔도 무의미할 수 있어 해당 tick을 즉시 중단합니다.
+
+
+## 11) 수동 점검 체크리스트
+
+### 서버 명령어
+
+```bash
+python -m compileall app tests
+python -m unittest discover -s tests -v
+sudo systemctl restart autotrade-engine autotrade-ui
+sudo systemctl status autotrade-engine autotrade-ui
+sudo journalctl -u autotrade-engine -f
+curl http://127.0.0.1:8000/health
+```
+
+### UI 확인 항목
+
+- `운영 상태` 탭에서 계좌 요약(주문가능현금/예수금/총자산) 카드가 표시되는지
+- `운영 상태`/`수동 진행` 탭에서 보유 종목 테이블이 표시되는지
+- `자동매수 후보 TOP N`에서 affordable=false 후보가 기본 숨김인지, 토글로 확인 가능한지
+- 수동 BUY 주문 시 사전검증에서 `INSUFFICIENT_CASH`/`MAX_BUY_EXCEEDED`가 구조화 메시지로 보이는지
+- LIVE에서 잔고 조회 실패 시 `status/rt_cd/msg1/raw`가 UI에 표시되는지

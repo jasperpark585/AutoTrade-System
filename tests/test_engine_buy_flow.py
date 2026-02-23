@@ -39,7 +39,7 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.engine = AutoTradingEngine(DummyConfigManager(), Database(), KakaoNotifier(None))
 
     def test_skip_insufficient_cash_then_try_next(self):
-        self.engine.kis.get_account_summary = Mock(return_value={"available_cash": 200000})
+        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 200000})
 
         candidates = [
             {"symbol": "A", "pass_fail": "PASS", "price": 300000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
@@ -56,7 +56,7 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertEqual(called, ["B"])
 
     def test_api_error_stops_loop(self):
-        self.engine.kis.get_account_summary = Mock(return_value={"available_cash": 10_000_000})
+        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
         candidates = [
             {"symbol": "A", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
             {"symbol": "B", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
@@ -68,6 +68,22 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.engine._try_entry = fail_try  # type: ignore[method-assign]
         with self.assertRaises(KISError):
             self.engine._attempt_buy_candidates(candidates)
+
+    def test_max_buy_exceeded_skips_candidate(self):
+        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
+        self.engine.config["risk_limits"]["max_buy_amount_per_trade_krw"] = 100_000
+        candidates = [
+            {"symbol": "A", "pass_fail": "PASS", "price": 200000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
+            {"symbol": "B", "pass_fail": "PASS", "price": 90000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
+        ]
+        called = []
+
+        def fake_try(symbol, price, reason, qty=None):
+            called.append(symbol)
+
+        self.engine._try_entry = fake_try  # type: ignore[method-assign]
+        self.engine._attempt_buy_candidates(candidates)
+        self.assertEqual(called, ["B"])
 
 
 if __name__ == "__main__":

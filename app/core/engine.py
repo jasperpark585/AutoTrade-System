@@ -28,6 +28,8 @@ class EngineRuntime:
     consecutive_losses: int = 0
     cooldown_until_epoch: float = 0.0
     fatal_error: str | None = None
+    portfolio_cache: dict[str, Any] = field(default_factory=dict)
+    portfolio_cache_ts: float = 0.0
 
 
 class AutoTradingEngine:
@@ -156,7 +158,7 @@ class AutoTradingEngine:
             }
             rows.append(row)
 
-        rows.sort(key=lambda x: x["total_score"], reverse=True)
+        rows.sort(key=lambda x: (x["total_score"], -x.get("stage_scores", {}).get("universe", 0), x.get("price", 0)), reverse=True)
         return rows
 
     def get_buy_candidates_preview(self, top_n: int = 10) -> list[dict[str, Any]]:
@@ -165,42 +167,62 @@ class AutoTradingEngine:
         candidates = self.build_candidates(quotes)
 
         try:
-            account = self.kis.get_account_summary()
+            account = self.kis.fetch_account_summary()
             available_cash = float(account.get("available_cash", 0) or 0)
         except Exception:
             available_cash = 0.0
 
-        max_buy = float(self.config["risk_limits"].get("max_buy_amount_per_trade_krw", 0))
         out: list[dict[str, Any]] = []
         for c in candidates[:top_n]:
             qty = 1
-            estimated_fees = max(0.0, c["price"] * qty * 0.00015)
-            estimated_cost = c["price"] * qty + estimated_fees
-            affordable = c["strategy_pass"] and estimated_cost <= available_cash and estimated_cost <= max_buy
+            ok, affordability_reason, detail = self.check_affordability(c["price"], qty, available_cash)
+            affordable = c["strategy_pass"] and ok
             skip_reason = ""
             if not c["strategy_pass"]:
                 skip_reason = "STRATEGY_FAIL"
-            elif estimated_cost > available_cash:
-                skip_reason = "INSUFFICIENT_CASH"
-            elif estimated_cost > max_buy:
-                skip_reason = "RISK_BLOCK"
+            elif not ok:
+                skip_reason = affordability_reason
             out.append(
                 {
                     "symbol": c["symbol"],
                     "total_score": c["total_score"],
                     "stage_summary": ", ".join([f"{k}:{'P' if v['passed'] else 'F'}" for k, v in c["stage_checks"].items()]),
                     "price": c["price"],
-                    "estimated_cost": round(estimated_cost, 2),
+                    "estimated_cost": round(detail["estimated_cost"], 2),
                     "affordable": affordable,
                     "skip_reason": skip_reason,
                 }
             )
         return out
 
+
+    def _max_buy_per_trade(self) -> float:
+        risk = self.config.get("risk_limits", {})
+        return float(risk.get("max_buy_amount_per_trade", risk.get("max_buy_amount_per_trade_krw", 0)))
+
+    def _estimate_cost(self, price: float, qty: int) -> float:
+        estimated_fees = max(0.0, price * qty * 0.00015)
+        return price * qty + estimated_fees
+
+    def check_affordability(self, price: float, qty: int, available_cash: float) -> tuple[bool, str, dict[str, Any]]:
+        max_buy = self._max_buy_per_trade()
+        estimated_cost = self._estimate_cost(price, qty)
+        detail = {
+            "price": price,
+            "qty": qty,
+            "estimated_cost": estimated_cost,
+            "available_cash": available_cash,
+            "max_buy_amount_per_trade": max_buy,
+        }
+        if estimated_cost > available_cash:
+            return False, "INSUFFICIENT_CASH", detail
+        if max_buy > 0 and estimated_cost > max_buy:
+            return False, "MAX_BUY_EXCEEDED", detail
+        return True, "OK", detail
+
     def _attempt_buy_candidates(self, candidates: list[dict[str, Any]]) -> None:
-        account = self.kis.get_account_summary()
+        account = self.kis.fetch_account_summary()
         available_cash = float(account.get("available_cash", 0) or 0)
-        max_buy = float(self.config["risk_limits"].get("max_buy_amount_per_trade_krw", 0))
 
         for c in candidates:
             if c["pass_fail"] != "PASS":
@@ -208,19 +230,10 @@ class AutoTradingEngine:
             if c["symbol"] in self.runtime.open_positions:
                 continue
             qty = 1
-            estimated_fees = max(0.0, c["price"] * qty * 0.00015)
-            estimated_cost = c["price"] * qty + estimated_fees
-
-            if estimated_cost > available_cash or estimated_cost > max_buy:
-                reason_detail = {
-                    "symbol": c["symbol"],
-                    "price": c["price"],
-                    "qty": qty,
-                    "estimated_cost": estimated_cost,
-                    "available_cash": available_cash,
-                    "max_buy_amount_per_trade": max_buy,
-                }
-                logger.info("blocker=INSUFFICIENT_CASH detail=%s", reason_detail)
+            ok, reason, detail = self.check_affordability(c["price"], qty, available_cash)
+            if not ok:
+                reason_detail = {"symbol": c["symbol"], **detail}
+                logger.info("blocker=%s detail=%s", reason, reason_detail)
                 continue
 
             try:
@@ -307,11 +320,26 @@ class AutoTradingEngine:
             "rows": rows,
         }
 
-    def get_portfolio_snapshot(self) -> dict[str, Any]:
+    def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
         self._reload_config()
-        summary = self.kis.get_account_summary()
-        positions = self.kis.get_positions()
-        return {"summary": summary, "positions": positions, "ts": datetime.utcnow().isoformat()}
+        ttl = int(os.getenv("PORTFOLIO_CACHE_SECONDS", "20"))
+        now = time.time()
+        if not force_refresh and self.runtime.portfolio_cache and (now - self.runtime.portfolio_cache_ts) < ttl:
+            return self.runtime.portfolio_cache
+
+        account = self.kis.fetch_account_summary()
+        positions = self.kis.fetch_positions()
+        snap = {"account": account, "positions": positions, "ts": datetime.utcnow().isoformat()}
+        self.runtime.portfolio_cache = snap
+        self.runtime.portfolio_cache_ts = now
+        return snap
+
+    def precheck_manual_buy(self, price: float, qty: int) -> dict[str, Any]:
+        self._reload_config()
+        account = self.kis.fetch_account_summary()
+        available_cash = float(account.get("available_cash", 0) or 0)
+        ok, reason, detail = self.check_affordability(price, qty, available_cash)
+        return {"ok": ok, "reason": reason, **detail}
 
     def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
         self._reload_config()
