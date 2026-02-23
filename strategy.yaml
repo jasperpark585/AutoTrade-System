@@ -27,6 +27,10 @@ stages:
     min_avg_turnover_krw: 3000000000
     min_price_krw: 1200
     max_spread_pct: 1.2
+    use_allowlist: false
+    allowlist_symbols:
+    - "005930"
+    - "000660"
     paid_override:
       enabled: false
       min_avg_turnover_krw: null

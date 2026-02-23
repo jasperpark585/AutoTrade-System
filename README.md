@@ -128,3 +128,23 @@ python -m compileall app
 - UI 수동주문/수동진단 오류는 `RetryError`를 언랩하여 최종 원인(`KISError`)을 표시합니다.
 - 표시 항목: 예외 타입, 메시지, `status_code`, `rt_cd`, `msg1`, raw 응답 일부.
 - 엔진 fatal 중지 시에도 동일 요약이 로그/알림/heartbeat `fatal_error`에 남습니다.
+
+
+## 9) allowlist 기반 우량주 운용
+
+- `strategy.yaml > stages.universe` 설정:
+  - `use_allowlist: true`
+  - `allowlist_symbols: ["005930", "000660", ...]`
+- `use_allowlist=true`일 때 allowlist 종목만 자동매수 후보에 포함됩니다.
+- 코드에 임의 우량주 하드코딩은 없고, 설정 파일에서만 제어합니다.
+
+## 10) 현금 부족 스킵 로직
+
+- 자동매수는 PASS 후보를 점수 내림차순으로 순차 시도합니다.
+- 주문 전 `available_cash`(주문가능현금) 조회 후 1주 기준 예상비용 계산:
+  - `estimated_cost = price * qty + estimated_fees`
+- 아래 조건이면 해당 후보를 즉시 스킵하고 다음 후보를 시도합니다.
+  - `estimated_cost > available_cash`
+  - `estimated_cost > max_buy_amount_per_trade_krw`
+- 로그에 `blocker=INSUFFICIENT_CASH`와 상세 정보(symbol/price/qty/estimated_cost/available_cash)가 기록됩니다.
+- 토큰/서버 장애 등 API_ERROR 계열은 후보를 바꿔도 무의미할 수 있어 해당 tick을 즉시 중단합니다.

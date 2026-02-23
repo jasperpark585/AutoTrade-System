@@ -13,6 +13,7 @@ from app.core.engine import AutoTradingEngine
 from app.core.market_hours import get_market_status
 from app.core.reporting import aggregate_performance, load_closed_trades, symbol_contribution
 from app.services.kakao import KakaoNotifier
+from app.services.kis_client import KISError
 from app.utils.errors import unwrap_exception
 
 st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
@@ -34,11 +35,32 @@ def _mask_env(value: str | None) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
+def _render_portfolio_snapshot() -> None:
+    st.subheader("계좌 요약 / 보유 종목")
+    try:
+        snap = engine.get_portfolio_snapshot()
+        summary = snap["summary"]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("주문가능현금", f"{summary.get('available_cash', 0):,.0f}원")
+        c2.metric("예수금", f"{summary.get('cash', 0):,.0f}원")
+        c3.metric("D+2 예수금", f"{summary.get('d2_deposit', 0):,.0f}원")
+        c4.metric("총평가", f"{summary.get('total_eval', 0):,.0f}원")
+        c5.metric("총자산", f"{summary.get('total_asset', 0):,.0f}원")
+        positions = pd.DataFrame(snap["positions"])
+        st.dataframe(positions, use_container_width=True)
+    except Exception as exc:
+        err_type, message, detail = unwrap_exception(exc)
+        st.error(f"잔고 조회 실패 [{err_type}]: {message}")
+        if detail:
+            st.json(detail)
+
 
 with tab1:
     status = get_market_status()
     st.subheader("장 상태")
     st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
+
+    _render_portfolio_snapshot()
 
     signals = db.fetch_df("SELECT created_at, symbol, total_score, stage_scores, pass_fail, reason FROM signals ORDER BY id DESC LIMIT 50")
     if not signals.empty:
@@ -47,7 +69,7 @@ with tab1:
     st.dataframe(signals, use_container_width=True)
 
     open_trades = db.fetch_df("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC")
-    st.subheader("보유 포지션")
+    st.subheader("보유 포지션(엔진 내부)")
     st.dataframe(open_trades, use_container_width=True)
 
 with tab2:
@@ -119,6 +141,22 @@ with tab4:
 
 with tab5:
     st.subheader("수동 진행 기능")
+    _render_portfolio_snapshot()
+
+    st.markdown("### 자동매수 후보 TOP N")
+    top_n = st.slider("후보 개수", min_value=3, max_value=20, value=10)
+    if st.button("후보 새로고침"):
+        try:
+            st.session_state["candidate_preview"] = engine.get_buy_candidates_preview(top_n=top_n)
+        except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
+            st.error(f"후보 조회 실패 [{err_type}]: {message}")
+            if detail:
+                st.json(detail)
+
+    if "candidate_preview" in st.session_state:
+        st.dataframe(pd.DataFrame(st.session_state["candidate_preview"]), use_container_width=True)
+
     if st.button("1) 수동 진단 실행", use_container_width=True):
         diag = engine.run_manual_diagnosis()
         st.session_state["manual_diag"] = diag
@@ -131,6 +169,8 @@ with tab5:
 
         if diag["error"]:
             st.error(f"시세/전략 진단 실패 [{diag.get('error_type')}]: {diag['error']}")
+            if diag.get("error_detail"):
+                st.json(diag["error_detail"])
 
         if diag["rows"]:
             df_diag = pd.DataFrame(diag["rows"])

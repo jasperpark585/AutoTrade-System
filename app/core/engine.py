@@ -11,9 +11,9 @@ from typing import Any
 from app.core.config import ConfigManager
 from app.core.database import Database
 from app.core.market_hours import get_market_status
-from app.core.strategy import StageStrategy
+from app.core.strategy import ScoreResult, StageStrategy
 from app.services.kakao import KakaoNotifier
-from app.services.kis_client import KISClient
+from app.services.kis_client import KISClient, KISError, Quote
 from app.utils.errors import unwrap_exception
 
 logger = logging.getLogger(__name__)
@@ -76,17 +76,19 @@ class AutoTradingEngine:
 
         try:
             quotes = self.kis.fetch_universe_quotes()
-            for q in quotes:
-                result = self.strategy.evaluate(q)
+            candidates = self.build_candidates(quotes)
+
+            for c in candidates:
                 self.db.insert_signal(
-                    q.symbol,
-                    result.total_score,
-                    json.dumps(result.stage_scores, ensure_ascii=False),
-                    "PASS" if result.passed else "FAIL",
-                    result.reason,
+                    c["symbol"],
+                    c["total_score"],
+                    json.dumps(c["stage_scores"], ensure_ascii=False),
+                    c["pass_fail"],
+                    c["reason"],
                 )
-                if result.passed and status.can_place_order:
-                    self._try_entry(q.symbol, q.price, result.reason)
+
+            if status.can_place_order:
+                self._attempt_buy_candidates(candidates)
 
             self._manage_positions(quotes)
         except Exception as exc:
@@ -125,6 +127,114 @@ class AutoTradingEngine:
 
         return True, "정상"
 
+    def build_candidates(self, quotes: list[Quote]) -> list[dict[str, Any]]:
+        universe = self.config.get("stages", {}).get("universe", {})
+        use_allowlist = bool(universe.get("use_allowlist", False))
+        allowlist_symbols = set(universe.get("allowlist_symbols", []) or [])
+
+        rows: list[dict[str, Any]] = []
+        for q in quotes:
+            result: ScoreResult = self.strategy.evaluate(q)
+            if use_allowlist and allowlist_symbols and q.symbol not in allowlist_symbols:
+                result = ScoreResult(
+                    passed=False,
+                    total_score=result.total_score,
+                    stage_scores=result.stage_scores,
+                    reason="allowlist 제외",
+                    stage_checks=result.stage_checks,
+                )
+
+            row: dict[str, Any] = {
+                "symbol": q.symbol,
+                "price": q.price,
+                "total_score": result.total_score,
+                "pass_fail": "PASS" if result.passed else "FAIL",
+                "reason": result.reason,
+                "stage_scores": result.stage_scores,
+                "stage_checks": result.stage_checks,
+                "strategy_pass": result.passed,
+            }
+            rows.append(row)
+
+        rows.sort(key=lambda x: x["total_score"], reverse=True)
+        return rows
+
+    def get_buy_candidates_preview(self, top_n: int = 10) -> list[dict[str, Any]]:
+        self._reload_config()
+        quotes = self.kis.fetch_universe_quotes()
+        candidates = self.build_candidates(quotes)
+
+        try:
+            account = self.kis.get_account_summary()
+            available_cash = float(account.get("available_cash", 0) or 0)
+        except Exception:
+            available_cash = 0.0
+
+        max_buy = float(self.config["risk_limits"].get("max_buy_amount_per_trade_krw", 0))
+        out: list[dict[str, Any]] = []
+        for c in candidates[:top_n]:
+            qty = 1
+            estimated_fees = max(0.0, c["price"] * qty * 0.00015)
+            estimated_cost = c["price"] * qty + estimated_fees
+            affordable = c["strategy_pass"] and estimated_cost <= available_cash and estimated_cost <= max_buy
+            skip_reason = ""
+            if not c["strategy_pass"]:
+                skip_reason = "STRATEGY_FAIL"
+            elif estimated_cost > available_cash:
+                skip_reason = "INSUFFICIENT_CASH"
+            elif estimated_cost > max_buy:
+                skip_reason = "RISK_BLOCK"
+            out.append(
+                {
+                    "symbol": c["symbol"],
+                    "total_score": c["total_score"],
+                    "stage_summary": ", ".join([f"{k}:{'P' if v['passed'] else 'F'}" for k, v in c["stage_checks"].items()]),
+                    "price": c["price"],
+                    "estimated_cost": round(estimated_cost, 2),
+                    "affordable": affordable,
+                    "skip_reason": skip_reason,
+                }
+            )
+        return out
+
+    def _attempt_buy_candidates(self, candidates: list[dict[str, Any]]) -> None:
+        account = self.kis.get_account_summary()
+        available_cash = float(account.get("available_cash", 0) or 0)
+        max_buy = float(self.config["risk_limits"].get("max_buy_amount_per_trade_krw", 0))
+
+        for c in candidates:
+            if c["pass_fail"] != "PASS":
+                continue
+            if c["symbol"] in self.runtime.open_positions:
+                continue
+            qty = 1
+            estimated_fees = max(0.0, c["price"] * qty * 0.00015)
+            estimated_cost = c["price"] * qty + estimated_fees
+
+            if estimated_cost > available_cash or estimated_cost > max_buy:
+                reason_detail = {
+                    "symbol": c["symbol"],
+                    "price": c["price"],
+                    "qty": qty,
+                    "estimated_cost": estimated_cost,
+                    "available_cash": available_cash,
+                    "max_buy_amount_per_trade": max_buy,
+                }
+                logger.info("blocker=INSUFFICIENT_CASH detail=%s", reason_detail)
+                continue
+
+            try:
+                self._try_entry(c["symbol"], c["price"], c["reason"], qty=qty)
+                # one successful/accepted order per tick
+                return
+            except Exception as exc:
+                err_type, _, detail = unwrap_exception(exc)
+                logger.warning("candidate order failed symbol=%s err_type=%s detail=%s", c["symbol"], err_type, detail)
+                if err_type.startswith("RetryError") or (detail and (detail.get("http_status") in {401, 403, 429, 500, 503})):
+                    logger.error("blocker=API_ERROR stop candidate loop")
+                    raise
+                continue
+
     def run_manual_diagnosis(self) -> dict[str, Any]:
         self._reload_config()
         market = get_market_status()
@@ -144,22 +254,22 @@ class AutoTradingEngine:
         rows: list[dict[str, Any]] = []
         try:
             quotes = self.kis.fetch_universe_quotes()
-            for q in quotes:
-                result = self.strategy.evaluate(q)
+            candidates = self.build_candidates(quotes)
+            for c in candidates:
                 row: dict[str, Any] = {
-                    "symbol": q.symbol,
-                    "price": round(q.price, 2),
-                    "total_score": result.total_score,
-                    "strategy_pass": result.passed,
-                    "strategy_reason": result.reason,
+                    "symbol": c["symbol"],
+                    "price": round(c["price"], 2),
+                    "total_score": c["total_score"],
+                    "strategy_pass": c["strategy_pass"],
+                    "strategy_reason": c["reason"],
                 }
-                for stage, info in result.stage_checks.items():
+                for stage, info in c["stage_checks"].items():
                     row[f"{stage}_pass"] = info["passed"]
                     row[f"{stage}_reason"] = info["reason"]
-                row["can_auto_order_now"] = bool(result.passed and market.can_place_order and risk_ok and env_reason == "정상")
+                row["can_auto_order_now"] = bool(c["strategy_pass"] and market.can_place_order and risk_ok and env_reason == "정상")
                 if not row["can_auto_order_now"]:
                     blockers = []
-                    if not result.passed:
+                    if not c["strategy_pass"]:
                         blockers.append("전략미통과")
                     if not market.can_place_order:
                         blockers.append(f"시장:{market.reason}")
@@ -172,14 +282,16 @@ class AutoTradingEngine:
                     row["blocker"] = "없음"
                 rows.append(row)
         except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
             return {
                 "market": market,
                 "risk_ok": risk_ok,
                 "risk_reason": risk_reason,
                 "env_check": env_check,
                 "env_reason": env_reason,
-                "error": self.format_exception(exc),
-                "error_type": type(exc).__name__,
+                "error": f"{err_type}: {message}",
+                "error_type": err_type,
+                "error_detail": detail,
                 "rows": rows,
             }
 
@@ -191,8 +303,15 @@ class AutoTradingEngine:
             "env_reason": env_reason,
             "error": None,
             "error_type": None,
+            "error_detail": {},
             "rows": rows,
         }
+
+    def get_portfolio_snapshot(self) -> dict[str, Any]:
+        self._reload_config()
+        summary = self.kis.get_account_summary()
+        positions = self.kis.get_positions()
+        return {"summary": summary, "positions": positions, "ts": datetime.utcnow().isoformat()}
 
     def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
         self._reload_config()
@@ -200,14 +319,15 @@ class AutoTradingEngine:
         logger.info("manual order result=%s", order)
         return order
 
-    def _try_entry(self, symbol: str, price: float, reason: str) -> None:
+    def _try_entry(self, symbol: str, price: float, reason: str, qty: int | None = None) -> None:
         if symbol in self.runtime.open_positions:
             return
         risk = self.config["risk_limits"]
         if len(self.runtime.open_positions) >= risk["max_positions"]:
             return
-        budget = risk["max_buy_amount_per_trade_krw"]
-        qty = int(budget // price)
+        if qty is None:
+            budget = risk["max_buy_amount_per_trade_krw"]
+            qty = int(budget // price)
         if qty <= 0:
             return
 

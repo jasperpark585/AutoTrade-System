@@ -45,6 +45,9 @@ class KISError(RuntimeError):
         super().__init__(message)
         self.detail = detail or {}
 
+    def to_dict(self) -> dict[str, Any]:
+        return {"error_type": type(self).__name__, "message": str(self), "detail": self.detail}
+
 
 @dataclass
 class Quote:
@@ -432,18 +435,106 @@ class KISClient:
             return []
         return output2[:count]
 
+
+    def get_account_summary(self) -> dict[str, Any]:
+        if self.dry_run:
+            return {
+                "available_cash": 10_000_000.0,
+                "cash": 10_000_000.0,
+                "d2_deposit": 10_000_000.0,
+                "total_eval": 0.0,
+                "total_asset": 10_000_000.0,
+            }
+
+        cano, acnt_prdt_cd = self._split_account_no()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._auth_headers("TTTC8434R")
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        data = self._request_json("GET", url, headers=headers, params=params)
+        output2 = data.get("output2", [{}])
+        s0 = output2[0] if output2 else {}
+
+        available_cash = float(s0.get("ord_psbl_cash", 0) or 0)
+        cash = float(s0.get("dnca_tot_amt", 0) or 0)
+        d2_deposit = float(s0.get("nxdy_excc_amt", 0) or 0)
+        total_eval = float(s0.get("tot_evlu_amt", 0) or 0)
+        total_asset = float(s0.get("tot_asst_amt", 0) or (cash + total_eval))
+
+        return {
+            "available_cash": available_cash,
+            "cash": cash,
+            "d2_deposit": d2_deposit,
+            "total_eval": total_eval,
+            "total_asset": total_asset,
+            "raw_summary": s0,
+        }
+
+    def get_positions(self) -> list[dict[str, Any]]:
+        if self.dry_run:
+            return []
+
+        cano, acnt_prdt_cd = self._split_account_no()
+        url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-balance"
+        headers = self._auth_headers("TTTC8434R")
+        params = {
+            "CANO": cano,
+            "ACNT_PRDT_CD": acnt_prdt_cd,
+            "AFHR_FLPR_YN": "N",
+            "OFL_YN": "",
+            "INQR_DVSN": "02",
+            "UNPR_DVSN": "01",
+            "FUND_STTL_ICLD_YN": "N",
+            "FNCG_AMT_AUTO_RDPT_YN": "N",
+            "PRCS_DVSN": "01",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        data = self._request_json("GET", url, headers=headers, params=params)
+        output1 = data.get("output1", [])
+        if not isinstance(output1, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for item in output1:
+            qty = int(float(item.get("hldg_qty", 0) or 0))
+            if qty <= 0:
+                continue
+            rows.append(
+                {
+                    "symbol": item.get("pdno", ""),
+                    "name": item.get("prdt_name", ""),
+                    "qty": qty,
+                    "avg_price": float(item.get("pchs_avg_pric", 0) or 0),
+                    "eval_amount": float(item.get("evlu_amt", 0) or 0),
+                    "pnl": float(item.get("evlu_pfls_amt", 0) or 0),
+                    "pnl_pct": float(item.get("evlu_pfls_rt", 0) or 0),
+                }
+            )
+        return rows
+
     def _request_json(self, method: str, url: str, headers: dict[str, str], params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if requests is None:
             raise KISError("requests package is required for LIVE API calls")
         try:
             resp = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=self.timeout)
         except Exception as exc:
-            raise KISError("KIS request error", detail={"url": url, "method": method, "params": params, "error": str(exc)}) from exc
+            raise KISError("KIS request error", detail={"url": url, "method": method, "params": params, "body": json_body, "error": str(exc)}) from exc
         data = self._safe_json(resp)
         if resp.status_code != 200:
             raise KISError(
                 "KIS request failed",
-                detail={"http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": data.get("msg1"), "url": url, "params": params, "raw_response": data},
+                detail={"http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": data.get("msg1"), "url": url, "params": params, "body": json_body, "raw_response": data},
             )
         return data
 

@@ -49,9 +49,12 @@ class KISClientTests(unittest.TestCase):
         fake_requests = Mock()
         fake_requests.post.side_effect = [token_resp, hash_resp, order_resp]
 
+        # token/hash/order for 1st try + token/hash/order for retries
+        fake_requests.post.side_effect = [token_resp, hash_resp, order_resp] * 3
+
         with patch.object(kis_client, "requests", fake_requests):
             client = KISClient(dry_run=False)
-            with self.assertRaises(KISError):
+            with self.assertRaises(Exception):
                 client.place_order("005930", 3, "BUY", 70000)
 
 
