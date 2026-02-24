@@ -479,36 +479,14 @@ class KISClient:
             "CTX_AREA_NK100": "",
         }
         data = self._request_json("GET", url, headers=headers, params=params)
-        output2 = data.get("output2", [])
+        output2 = data.get("output2", [{}])
+        s0 = output2[0] if output2 else {}
 
-        if isinstance(output2, list) and len(output2) > 0:
-            s0 = output2[0]
-        else:
-            s0 = {}
-
-        def to_float(x):
-            if x is None:
-                return 0.0
-            return float(str(x).replace(",", "").strip() or 0)
-
-        available_cash = to_float(
-            s0.get("ord_psbl_cash")
-            or s0.get("ord_psbl_cash_amt")
-            or 0
-        )
-
-        cash = to_float(
-            s0.get("dnca_tot_amt")
-            or s0.get("dnca_tot_amt_amt")
-            or 0
-        )
-        d2_deposit = to_float(s0.get("nxdy_excc_amt") or 0)
-        total_eval = to_float(s0.get("tot_evlu_amt") or 0)
-        total_asset = to_float(s0.get("tot_asst_amt") or (cash + total_eval))
-
-        if os.getenv("KIS_DEBUG_RAW", "false").lower() == "true":
-            logger.info("[ACCOUNT RAW] output2=%s", output2)
-            logger.info("[ACCOUNT PARSED] available_cash=%s, cash=%s", available_cash, cash)
+        available_cash = float(s0.get("ord_psbl_cash", 0) or 0)
+        cash = float(s0.get("dnca_tot_amt", 0) or 0)
+        d2_deposit = float(s0.get("nxdy_excc_amt", 0) or 0)
+        total_eval = float(s0.get("tot_evlu_amt", 0) or 0)
+        total_asset = float(s0.get("tot_asst_amt", 0) or (cash + total_eval))
 
         return {
             "available_cash": available_cash,
@@ -604,13 +582,6 @@ class KISClient:
                 }
             )
         return out
-
-    def get_token_status(self) -> dict[str, Any]:
-        return {
-            "has_token": bool(self._token),
-            "token_expire_at": self._token_expire_at.isoformat() if self._token_expire_at else None,
-            "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat() if self._token_retry_after_epoch else None,
-        }
 
     def _request_json(self, method: str, url: str, headers: dict[str, str], params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if requests is None:

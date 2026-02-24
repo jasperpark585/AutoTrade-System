@@ -97,26 +97,9 @@ class Database:
                 (datetime.utcnow().isoformat(), exit_price, pnl, pnl_pct, fees, reason_exit, trade_id),
             )
 
-    def set_engine_state(self, key: str, value: str) -> None:
-        with self.connect() as con:
-            con.execute(
-                """
-                INSERT INTO engine_state(key, value, updated_at)
-                VALUES(?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-                """,
-                (key, value, datetime.utcnow().isoformat()),
-            )
-
-    def get_engine_state(self, key: str, default: str | None = None) -> str | None:
-        with self.connect() as con:
-            row = con.execute("SELECT value FROM engine_state WHERE key=?", (key,)).fetchone()
-            if not row:
-                return default
-            return str(row["value"])
-
     def fetch_df(self, query: str):
         import pandas as pd
 
         with self.connect() as con:
             return pd.read_sql_query(query, con)
+
