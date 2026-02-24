@@ -90,6 +90,33 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertTrue(self.engine.get_auto_trading_enabled())
         self.assertEqual(self.engine.runtime.blocker, "KIS_TOKEN_COOLDOWN")
 
+
+    @patch("app.core.engine.get_market_status")
+    def test_last_good_orderable_persists_on_token_cooldown(self, mock_market):
+        mock_market.return_value = type("S", (), {"can_place_order": False, "reason": "장마감", "is_open": False})()
+        self.engine.set_auto_trading_enabled(True)
+
+        snapshots = [
+            {"account": {"orderable_cash": 120398, "available_cash": 120398, "d2_cash": 121280}, "warning": ""},
+        ]
+
+        def first_snap(*args, **kwargs):
+            return snapshots.pop(0)
+
+        self.engine.get_portfolio_snapshot = first_snap  # type: ignore[method-assign]
+        self.engine.tick()
+        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
+
+        def fail_snap(*args, **kwargs):
+            raise KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"})
+
+        self.engine.get_portfolio_snapshot = fail_snap  # type: ignore[method-assign]
+        self.engine.tick()
+
+        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
+        self.assertEqual(self.engine.runtime.orderable_cash_source, "cached")
+        self.assertEqual(self.engine.db.get_engine_state_float("last_good_orderable_cash"), 120398.0)
+
     def test_max_buy_exceeded_skips_candidate(self):
         self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
         self.engine.config["risk_limits"]["max_buy_amount_per_trade_krw"] = 100_000

@@ -115,6 +115,19 @@ class Database:
                 return default
             return str(row["value"])
 
+
+    def set_engine_state_float(self, key: str, value: float) -> None:
+        self.set_engine_state(key, f"{float(value):.6f}")
+
+    def get_engine_state_float(self, key: str, default: float = 0.0) -> float:
+        raw = self.get_engine_state(key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
     def fetch_df(self, query: str):
         import pandas as pd
 

@@ -52,6 +52,7 @@ def _show_toggle_status() -> None:
 
 
 def _show_portfolio(force_refresh: bool = False, include_controls: bool = False) -> None:
+    hb = engine.heartbeat()
     if include_controls:
         c1, c2 = st.columns([1, 2])
         auto_on = c1.checkbox("자동 갱신", value=False, key="portfolio_auto")
@@ -59,28 +60,39 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
         if auto_on and st_autorefresh is not None:
             st_autorefresh(interval=sec * 1000, key="portfolio_refresh_counter")
 
-    if st.button("포트폴리오 수동 갱신", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}"):
-        force_refresh = True
+    cooldown_active = hb.get("blocker") == "KIS_TOKEN_COOLDOWN"
+    refresh_disabled = bool(cooldown_active and hb.get("next_retry_at"))
+    if st.button("포트폴리오 캐시 다시읽기", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}", disabled=refresh_disabled):
+        st.rerun()
+
+    if refresh_disabled:
+        st.warning(f"KIS token cooldown active. next_retry_at={hb.get('next_retry_at')} (UI는 KIS 직접 호출 없이 캐시만 표시)")
 
     try:
-        snap = engine.get_portfolio_snapshot(force_refresh=force_refresh)
-        account = snap["account"]
-        st.caption(f"마지막 갱신: {snap.get('ts', '-')}")
+        snap = engine.get_cached_portfolio_snapshot() or {}
+        account = snap.get("account", {})
+        st.caption(f"마지막 스냅샷: {snap.get('ts', '-')}")
+        orderable_cash = float(hb.get("orderable_cash", 0) or 0)
+        source = str(hb.get("orderable_cash_source", "unknown") or "unknown")
+        d2_cash = float(hb.get("d2_cash", snap.get("d2_cash", account.get("d2_cash", 0))) or 0)
+
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("주문가능금액", f"{snap.get('orderable_cash', account.get('orderable_cash', 0)):,.0f}원")
-        c2.metric("D+2 예수금", f"{snap.get('d2_cash', account.get('d2_cash', 0)):,.0f}원")
+        orderable_label = "주문가능금액" if source != "cached" else "주문가능금액 (cached)"
+        c1.metric(orderable_label, f"{orderable_cash:,.0f}원")
+        c2.metric("D+2 예수금", f"{d2_cash:,.0f}원")
         c3.metric("총 평가금액", f"{account.get('total_eval', 0):,.0f}원")
         total_pnl = float(account.get("raw_summary", {}).get("evlu_pfls_smtl_amt", 0) or 0)
         total_ret = float(account.get("raw_summary", {}).get("evlu_pfls_rt", 0) or 0)
         c4.metric("총 손익/수익률", f"{total_pnl:,.0f}원 / {total_ret:.2f}%")
 
+        if hb.get("last_good_orderable_at"):
+            st.caption(f"last_good_orderable_at: {hb.get('last_good_orderable_at')}")
+
         st.markdown("#### 보유종목")
         st.dataframe(pd.DataFrame(snap.get("positions", [])), use_container_width=True)
         st.markdown("#### 주문/체결(최근 N건)")
         st.dataframe(pd.DataFrame(snap.get("orders", [])), use_container_width=True)
-        if snap.get("throttle", {}).get("throttled"):
-            st.info(f"KIS 호출 throttle 적용: {snap['throttle']}")
-        if snap.get("warning") == "ORDERABLE_CASH_MAPPING_SUSPECT":
+        if snap.get("warning") == "ORDERABLE_CASH_MAPPING_SUSPECT" or hb.get("snapshot_warning") == "ORDERABLE_CASH_MAPPING_SUSPECT":
             st.warning("주문가능금액 매핑 의심: KIS 응답 키 확인 필요(디버그 로그 참조).")
     except Exception as exc:
         err_type, message, detail = unwrap_exception(exc)

@@ -34,6 +34,8 @@ class EngineRuntime:
     orderable_cash: float = 0.0
     available_cash: float = 0.0
     d2_cash: float = 0.0
+    orderable_cash_source: str = "unknown"
+    last_good_orderable_at: str | None = None
     snapshot_warning: str = ""
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
@@ -49,6 +51,7 @@ class AutoTradingEngine:
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self._reload_config()
+        self._restore_last_good_orderable(source="cached")
 
     def _reload_config(self) -> None:
         self.base_config = self.cfg_mgr.load()
@@ -99,6 +102,20 @@ class AutoTradingEngine:
             return True, None
         return False, None
 
+    def _restore_last_good_orderable(self, source: str = "cached") -> None:
+        last_good = self.db.get_engine_state_float("last_good_orderable_cash", default=0.0)
+        if last_good > 0:
+            self.runtime.orderable_cash = last_good
+            self.runtime.available_cash = last_good
+            self.runtime.orderable_cash_source = source
+        self.runtime.last_good_orderable_at = self.db.get_engine_state("last_good_orderable_at")
+
+    def _save_last_good_orderable(self, value: float) -> None:
+        self.db.set_engine_state_float("last_good_orderable_cash", value)
+        ts = datetime.utcnow().isoformat()
+        self.db.set_engine_state("last_good_orderable_at", ts)
+        self.runtime.last_good_orderable_at = ts
+
     def heartbeat(self) -> dict[str, Any]:
         return {
             "enabled": self.get_auto_trading_enabled(),
@@ -109,6 +126,8 @@ class AutoTradingEngine:
             "orderable_cash": self.runtime.orderable_cash,
             "available_cash": self.runtime.available_cash,
             "d2_cash": self.runtime.d2_cash,
+            "orderable_cash_source": self.runtime.orderable_cash_source,
+            "last_good_orderable_at": self.runtime.last_good_orderable_at,
             "snapshot_warning": self.runtime.snapshot_warning,
             "candidates_count": self.runtime.candidates_count,
             "recent_blockers": self.runtime.recent_blockers[-5:],
@@ -161,18 +180,26 @@ class AutoTradingEngine:
         try:
             snap = self.get_portfolio_snapshot(force_refresh=False)
             account = snap.get("account", {})
-            self.runtime.orderable_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
-            self.runtime.available_cash = float(account.get("available_cash", self.runtime.orderable_cash) or 0)
+            live_orderable = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
+            self.runtime.available_cash = float(account.get("available_cash", live_orderable) or 0)
             self.runtime.d2_cash = float(account.get("d2_cash", account.get("d2_deposit", 0)) or 0)
             self.runtime.snapshot_warning = str(snap.get("warning") or "")
+            if live_orderable > 0:
+                self.runtime.orderable_cash = live_orderable
+                self.runtime.orderable_cash_source = "realtime"
+                self._save_last_good_orderable(live_orderable)
+            else:
+                self._restore_last_good_orderable(source="cached")
             self._apply_profile_by_cash(self.runtime.orderable_cash)
             self._clear_blocker()
         except Exception as exc:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return
+            self._restore_last_good_orderable(source="cached")
             logger.warning("tick skip reason=PORTFOLIO_FETCH_FAIL detail=%s", self.format_exception(exc))
 
         status = get_market_status()
@@ -201,6 +228,7 @@ class AutoTradingEngine:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return
             formatted = self.format_exception(exc)
@@ -385,6 +413,10 @@ class AutoTradingEngine:
             return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": f"{err_type}: {message}", "error_detail": detail, "rows": rows}
         return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": None, "error_detail": {}, "rows": rows}
 
+    def get_cached_portfolio_snapshot(self) -> dict[str, Any] | None:
+        snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
+        return snap
+
     def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
         self._reload_config()
         snap, state = self.portfolio_service.get_snapshot(force_refresh=force_refresh)
@@ -419,6 +451,8 @@ class AutoTradingEngine:
             "d2_cash": d2_cash,
             "snapshot_source": "account_summary_v2",
             "warning": warning,
+            "orderable_cash_source": "realtime" if orderable_cash > 0 else "unknown",
+            "last_good_orderable_at": self.db.get_engine_state("last_good_orderable_at"),
             "positions": positions,
             "orders": orders,
             "token_status": self.kis.get_token_status(),
