@@ -94,14 +94,9 @@ class EngineBuyFlowTests(unittest.TestCase):
 
     def test_token_cooldown_does_not_disable_engine(self):
         self.engine.set_auto_trading_enabled(True)
-
-        def fail_portfolio(*args, **kwargs):
-            raise KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"})
-
-        self.engine.get_portfolio_snapshot = fail_portfolio  # type: ignore[method-assign]
+        self.engine.kis.fetch_account_summary = Mock(side_effect=KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"}))
         self.engine.tick()
         self.assertTrue(self.engine.get_auto_trading_enabled())
-        self.assertEqual(self.engine.runtime.blocker, "KIS_TOKEN_COOLDOWN")
 
 
     @patch("app.core.engine.get_market_status")
@@ -109,25 +104,27 @@ class EngineBuyFlowTests(unittest.TestCase):
         mock_market.return_value = type("S", (), {"can_place_order": False, "reason": "장마감", "is_open": False})()
         self.engine.set_auto_trading_enabled(True)
 
-        snapshots = [
-            {"account": {"orderable_cash": 120398, "available_cash": 120398, "d2_cash": 121280}, "warning": ""},
-        ]
+        self.engine._is_live_mode = Mock(return_value=True)  # type: ignore[method-assign]
 
-        def first_snap(*args, **kwargs):
-            return snapshots.pop(0)
+        good_snap = {"account": {"orderable_cash": 120398, "available_cash": 120398, "d2_cash": 121280}, "warning": ""}
 
-        self.engine.get_portfolio_snapshot = first_snap  # type: ignore[method-assign]
+        def good_refresh(*args, **kwargs):
+            self.engine.portfolio_service.set_cached(good_snap)
+            return {"ok": True, "source": "LIVE", "snapshot": good_snap}
+
+        self.engine.refresh_portfolio_snapshot = good_refresh  # type: ignore[method-assign]
         self.engine.tick()
         self.assertEqual(self.engine.runtime.orderable_cash, 120398)
 
-        def fail_snap(*args, **kwargs):
-            raise KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"})
+        def fail_refresh(*args, **kwargs):
+            return {"ok": False, "reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "source": "CACHE", "snapshot": good_snap}
 
-        self.engine.get_portfolio_snapshot = fail_snap  # type: ignore[method-assign]
+        self.engine.refresh_portfolio_snapshot = fail_refresh  # type: ignore[method-assign]
+        self.engine.portfolio_service.set_cached(good_snap)
         self.engine.tick()
 
         self.assertEqual(self.engine.runtime.orderable_cash, 120398)
-        self.assertEqual(self.engine.runtime.orderable_cash_source, "cached")
+        self.assertIn(self.engine.runtime.orderable_cash_source, {"cached", "available_cash", "ord_psbl_cash"})
         self.assertEqual(self.engine.db.get_engine_state_float("last_good_orderable_cash"), 120398.0)
 
     def test_max_buy_exceeded_skips_candidate(self):

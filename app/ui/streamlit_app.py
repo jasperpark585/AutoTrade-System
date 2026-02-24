@@ -7,6 +7,11 @@ from io import StringIO
 import pandas as pd
 import streamlit as st
 
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
 from app.core.config import ConfigManager
 from app.core.database import Database
 from app.core.engine import AutoTradingEngine
@@ -62,11 +67,28 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
 
     cooldown_active = hb.get("blocker") == "KIS_TOKEN_COOLDOWN"
     refresh_disabled = bool(cooldown_active and hb.get("next_retry_at"))
-    if st.button("포트폴리오 캐시 다시읽기", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}", disabled=refresh_disabled):
-        st.rerun()
+    if st.button("포트폴리오 수동 갱신", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}", disabled=refresh_disabled):
+        if requests is None:
+            st.warning("requests 패키지가 없어 엔진 API 호출을 수행할 수 없습니다.")
+        else:
+            try:
+                resp = requests.post("http://127.0.0.1:8000/refresh/portfolio", timeout=8)
+                payload = resp.json() if resp.status_code == 200 else {"ok": False, "result": {"reason": f"HTTP_{resp.status_code}"}}
+                result = payload.get("result", {})
+                if payload.get("ok"):
+                    st.success(f"포트폴리오 갱신 완료 source={result.get('source')} last_updated={result.get('snapshot', {}).get('ts')}")
+                else:
+                    st.warning(f"포트폴리오 갱신 실패/제한: reason={result.get('reason')} next_retry_at={result.get('next_retry_at')}")
+                    with st.expander("상세"):
+                        st.json(result)
+            except Exception as exc:
+                err_type, message, detail = unwrap_exception(exc)
+                st.warning(f"포트폴리오 갱신 호출 실패 [{err_type}]: {message}")
+                with st.expander("상세"):
+                    st.json(detail or {})
 
     if refresh_disabled:
-        st.warning(f"KIS token cooldown active. next_retry_at={hb.get('next_retry_at')} (UI는 KIS 직접 호출 없이 캐시만 표시)")
+        st.warning(f"KIS token cooldown active. next_retry_at={hb.get('next_retry_at')} (UI는 KIS 직접 호출 없이 엔진 API/캐시만 사용)")
 
     try:
         snap = engine.get_cached_portfolio_snapshot() or {}

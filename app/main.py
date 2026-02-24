@@ -31,6 +31,23 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+    def do_POST(self):  # noqa: N802
+        if self.path not in {"/refresh/portfolio", "/portfolio/refresh"}:
+            self.send_response(404)
+            self.end_headers()
+            return
+        if not self.engine:
+            self.send_response(503)
+            self.end_headers()
+            return
+        result = self.engine.refresh_portfolio_snapshot(force=True, trigger="manual")
+        body = json.dumps({"ok": bool(result.get("ok")), "result": result}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
 
 
 def run() -> None:

@@ -40,6 +40,7 @@ class EngineRuntime:
     snapshot_warning: str = ""
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
+    last_portfolio_refresh_epoch: float = 0.0
 
 
 class AutoTradingEngine:
@@ -209,12 +210,14 @@ class AutoTradingEngine:
             return
 
         try:
-            snap = self.get_portfolio_snapshot(force_refresh=False)
-            account = snap.get("account", {})
+            if self._is_live_mode():
+                self.refresh_portfolio_snapshot(force=False, trigger="tick")
+            snap = self.get_cached_portfolio_snapshot() or {}
+            account = snap.get("account", {}) if isinstance(snap, dict) else {}
             live_orderable, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
-            self.runtime.available_cash = self._money_to_float(account.get("available_cash", live_orderable))
-            self.runtime.d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)))
-            self.runtime.snapshot_warning = str(snap.get("warning") or "")
+            self.runtime.available_cash = self._money_to_float(account.get("available_cash", live_orderable) if isinstance(account, dict) else live_orderable)
+            self.runtime.d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)) if isinstance(account, dict) else 0)
+            self.runtime.snapshot_warning = str((snap or {}).get("warning") or "")
             if live_orderable > 0:
                 self.runtime.orderable_cash = live_orderable
                 self.runtime.orderable_cash_source = source
@@ -448,6 +451,38 @@ class AutoTradingEngine:
     def get_cached_portfolio_snapshot(self) -> dict[str, Any] | None:
         snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
         return snap
+
+    def _is_live_mode(self) -> bool:
+        return str(self.config.get("mode", "DRY-RUN")).upper() == "LIVE"
+
+    def refresh_portfolio_snapshot(self, force: bool = False, trigger: str = "manual") -> dict[str, Any]:
+        self._reload_config()
+        now = time.time()
+        min_gap_sec = 60
+        if trigger == "tick":
+            min_gap_sec = int(self.config.get("portfolio_refresh_interval_sec", 300))
+        next_allowed = float(self.db.get_engine_state_float("portfolio_refresh_next_retry_epoch", default=0.0))
+        if not force and now < next_allowed:
+            next_retry_at = datetime.utcfromtimestamp(next_allowed).isoformat()
+            return {"ok": False, "reason": "PORTFOLIO_REFRESH_RATE_LIMIT", "next_retry_at": next_retry_at, "source": "CACHE", "snapshot": self.get_cached_portfolio_snapshot()}
+
+        self.db.set_engine_state_float("portfolio_refresh_next_retry_epoch", now + min_gap_sec)
+
+        if not self._is_live_mode() and trigger != "tick":
+            snap = self.get_cached_portfolio_snapshot() or self.get_portfolio_snapshot(force_refresh=False)
+            return {"ok": True, "reason": "DRY_RUN_CACHE", "source": "CACHE", "snapshot": snap}
+
+        try:
+            snap = self.get_portfolio_snapshot(force_refresh=True)
+            self.runtime.last_portfolio_refresh_epoch = now
+            self.db.set_engine_state("last_portfolio_refresh_at", datetime.utcnow().isoformat())
+            return {"ok": True, "reason": "LIVE_REFRESHED", "source": "LIVE", "snapshot": snap}
+        except Exception as exc:
+            is_temp, next_retry = self._is_temporary_kis_error(exc)
+            if is_temp:
+                self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+            cached = self.get_cached_portfolio_snapshot()
+            return {"ok": False, "reason": self.format_exception(exc), "next_retry_at": next_retry, "source": "CACHE", "snapshot": cached}
 
     def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
         self._reload_config()
