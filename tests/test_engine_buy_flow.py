@@ -71,6 +71,19 @@ class EngineBuyFlowTests(unittest.TestCase):
 
 
 
+
+    def test_compute_orderable_fallback_to_dnca_when_available_zero(self):
+        account = {"available_cash": 0, "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
+        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
+        self.assertEqual(value, 178280)
+        self.assertEqual(source, "raw_summary.dnca_tot_amt")
+
+    def test_compute_orderable_prefers_available_cash(self):
+        account = {"available_cash": "120,398", "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
+        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
+        self.assertEqual(value, 120398)
+        self.assertEqual(source, "available_cash")
+
     def test_preview_never_calls_live_quotes(self):
         with patch("app.services.news_client.NewsClient.load_candidates", return_value=[{"symbol": "005930", "score": 10.0}]),              patch("app.services.news_client.NewsClient.load_state", return_value={"last_updated_at": "2026-01-01T00:00:00", "next_update_at": "2026-01-01T00:30:00"}),              patch("app.services.kis_client.KISClient.fetch_universe_quotes") as mock_quotes:
             preview = self.engine.get_buy_candidates_preview(top_n=5)

@@ -85,8 +85,7 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
         total_ret = float(account.get("raw_summary", {}).get("evlu_pfls_rt", 0) or 0)
         c4.metric("총 손익/수익률", f"{total_pnl:,.0f}원 / {total_ret:.2f}%")
 
-        if hb.get("last_good_orderable_at"):
-            st.caption(f"last_good_orderable_at: {hb.get('last_good_orderable_at')}")
+        st.caption(f"source={hb.get('orderable_cash_source')} stale={hb.get('orderable_cash_stale')} last_updated={hb.get('orderable_cash_last_updated_at')}")
 
         st.markdown("#### 보유종목")
         st.dataframe(pd.DataFrame(snap.get("positions", [])), use_container_width=True)

@@ -35,7 +35,8 @@ class EngineRuntime:
     available_cash: float = 0.0
     d2_cash: float = 0.0
     orderable_cash_source: str = "unknown"
-    last_good_orderable_at: str | None = None
+    orderable_cash_stale: bool = True
+    orderable_cash_last_updated_at: str | None = None
     snapshot_warning: str = ""
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
@@ -102,19 +103,48 @@ class AutoTradingEngine:
             return True, None
         return False, None
 
+    @staticmethod
+    def _money_to_float(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).replace(",", "").strip()
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _compute_orderable_cash(self, account: dict[str, Any]) -> tuple[float, str]:
+        raw = account.get("raw_summary", {}) if isinstance(account.get("raw_summary"), dict) else {}
+        candidates: list[tuple[str, Any]] = [
+            ("ord_psbl_cash", account.get("ord_psbl_cash", raw.get("ord_psbl_cash"))),
+            ("available_cash", account.get("available_cash")),
+            ("raw_summary.dnca_tot_amt", raw.get("dnca_tot_amt")),
+            ("cash", account.get("cash")),
+        ]
+        for source, val in candidates:
+            num = self._money_to_float(val)
+            if num > 0:
+                return num, source
+        return 0.0, "none"
+
     def _restore_last_good_orderable(self, source: str = "cached") -> None:
         last_good = self.db.get_engine_state_float("last_good_orderable_cash", default=0.0)
         if last_good > 0:
             self.runtime.orderable_cash = last_good
-            self.runtime.available_cash = last_good
+            self.runtime.available_cash = max(self.runtime.available_cash, last_good)
             self.runtime.orderable_cash_source = source
-        self.runtime.last_good_orderable_at = self.db.get_engine_state("last_good_orderable_at")
+            self.runtime.orderable_cash_stale = True
+        self.runtime.orderable_cash_last_updated_at = self.db.get_engine_state("last_good_orderable_at")
 
     def _save_last_good_orderable(self, value: float) -> None:
         self.db.set_engine_state_float("last_good_orderable_cash", value)
         ts = datetime.utcnow().isoformat()
         self.db.set_engine_state("last_good_orderable_at", ts)
-        self.runtime.last_good_orderable_at = ts
+        self.runtime.orderable_cash_last_updated_at = ts
 
     def heartbeat(self) -> dict[str, Any]:
         return {
@@ -127,7 +157,8 @@ class AutoTradingEngine:
             "available_cash": self.runtime.available_cash,
             "d2_cash": self.runtime.d2_cash,
             "orderable_cash_source": self.runtime.orderable_cash_source,
-            "last_good_orderable_at": self.runtime.last_good_orderable_at,
+            "orderable_cash_stale": self.runtime.orderable_cash_stale,
+            "orderable_cash_last_updated_at": self.runtime.orderable_cash_last_updated_at,
             "snapshot_warning": self.runtime.snapshot_warning,
             "candidates_count": self.runtime.candidates_count,
             "recent_blockers": self.runtime.recent_blockers[-5:],
@@ -180,13 +211,14 @@ class AutoTradingEngine:
         try:
             snap = self.get_portfolio_snapshot(force_refresh=False)
             account = snap.get("account", {})
-            live_orderable = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
-            self.runtime.available_cash = float(account.get("available_cash", live_orderable) or 0)
-            self.runtime.d2_cash = float(account.get("d2_cash", account.get("d2_deposit", 0)) or 0)
+            live_orderable, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
+            self.runtime.available_cash = self._money_to_float(account.get("available_cash", live_orderable))
+            self.runtime.d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)))
             self.runtime.snapshot_warning = str(snap.get("warning") or "")
             if live_orderable > 0:
                 self.runtime.orderable_cash = live_orderable
-                self.runtime.orderable_cash_source = "realtime"
+                self.runtime.orderable_cash_source = source
+                self.runtime.orderable_cash_stale = False
                 self._save_last_good_orderable(live_orderable)
             else:
                 self._restore_last_good_orderable(source="cached")
@@ -423,9 +455,11 @@ class AutoTradingEngine:
         if snap:
             return snap
         account = self.kis.fetch_account_summary()
-        orderable_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
-        available_cash = float(account.get("available_cash", orderable_cash) or 0)
-        d2_cash = float(account.get("d2_cash", account.get("d2_deposit", 0)) or 0)
+        orderable_cash, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
+        available_cash = self._money_to_float(account.get("available_cash", orderable_cash))
+        if available_cash <= 0 and orderable_cash > 0:
+            available_cash = orderable_cash
+        d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)))
         warning = ""
         selected_keys = account.get("selected_keys", {}) if isinstance(account.get("selected_keys"), dict) else {}
         if orderable_cash == 0 and d2_cash > 0:
@@ -451,8 +485,9 @@ class AutoTradingEngine:
             "d2_cash": d2_cash,
             "snapshot_source": "account_summary_v2",
             "warning": warning,
-            "orderable_cash_source": "realtime" if orderable_cash > 0 else "unknown",
-            "last_good_orderable_at": self.db.get_engine_state("last_good_orderable_at"),
+            "orderable_cash_source": source if orderable_cash > 0 else "unknown",
+            "orderable_cash_stale": False,
+            "orderable_cash_last_updated_at": self.db.get_engine_state("last_good_orderable_at"),
             "positions": positions,
             "orders": orders,
             "token_status": self.kis.get_token_status(),
