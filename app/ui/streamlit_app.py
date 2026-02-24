@@ -67,8 +67,8 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
         account = snap["account"]
         st.caption(f"마지막 갱신: {snap.get('ts', '-')}")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("주문가능금액", f"{account.get('available_cash', 0):,.0f}원")
-        c2.metric("D+2 예수금", f"{account.get('d2_deposit', 0):,.0f}원")
+        c1.metric("주문가능금액", f"{snap.get('orderable_cash', account.get('orderable_cash', 0)):,.0f}원")
+        c2.metric("D+2 예수금", f"{snap.get('d2_cash', account.get('d2_cash', 0)):,.0f}원")
         c3.metric("총 평가금액", f"{account.get('total_eval', 0):,.0f}원")
         total_pnl = float(account.get("raw_summary", {}).get("evlu_pfls_smtl_amt", 0) or 0)
         total_ret = float(account.get("raw_summary", {}).get("evlu_pfls_rt", 0) or 0)
@@ -80,6 +80,8 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
         st.dataframe(pd.DataFrame(snap.get("orders", [])), use_container_width=True)
         if snap.get("throttle", {}).get("throttled"):
             st.info(f"KIS 호출 throttle 적용: {snap['throttle']}")
+        if snap.get("warning") == "ORDERABLE_CASH_MAPPING_SUSPECT":
+            st.warning("주문가능금액 매핑 의심: KIS 응답 키 확인 필요(디버그 로그 참조).")
     except Exception as exc:
         err_type, message, detail = unwrap_exception(exc)
         st.error(f"포트폴리오 조회 실패 [{err_type}]: {message}")

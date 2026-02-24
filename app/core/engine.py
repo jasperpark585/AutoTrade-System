@@ -32,6 +32,9 @@ class EngineRuntime:
     blocker: str = ""
     blocker_next_retry_at: str | None = None
     orderable_cash: float = 0.0
+    available_cash: float = 0.0
+    d2_cash: float = 0.0
+    snapshot_warning: str = ""
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
 
@@ -104,6 +107,9 @@ class AutoTradingEngine:
             "next_retry_at": self.runtime.blocker_next_retry_at,
             "current_profile": self.runtime.current_profile,
             "orderable_cash": self.runtime.orderable_cash,
+            "available_cash": self.runtime.available_cash,
+            "d2_cash": self.runtime.d2_cash,
+            "snapshot_warning": self.runtime.snapshot_warning,
             "candidates_count": self.runtime.candidates_count,
             "recent_blockers": self.runtime.recent_blockers[-5:],
             "open_positions": len(self.runtime.open_positions),
@@ -154,7 +160,11 @@ class AutoTradingEngine:
 
         try:
             snap = self.get_portfolio_snapshot(force_refresh=False)
-            self.runtime.orderable_cash = float(snap.get("account", {}).get("available_cash", 0) or 0)
+            account = snap.get("account", {})
+            self.runtime.orderable_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
+            self.runtime.available_cash = float(account.get("available_cash", self.runtime.orderable_cash) or 0)
+            self.runtime.d2_cash = float(account.get("d2_cash", account.get("d2_deposit", 0)) or 0)
+            self.runtime.snapshot_warning = str(snap.get("warning") or "")
             self._apply_profile_by_cash(self.runtime.orderable_cash)
             self._clear_blocker()
         except Exception as exc:
@@ -341,7 +351,7 @@ class AutoTradingEngine:
 
     def _attempt_buy_candidates(self, candidates: list[dict[str, Any]]) -> None:
         account = self.kis.fetch_account_summary()
-        available_cash = float(account.get("available_cash", 0) or 0)
+        available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
         if available_cash <= 0:
             logger.warning("event=BUY_SKIP reason=CASH_ZERO orderable_cash=0 candidates=%s", len(candidates))
             return
@@ -381,9 +391,40 @@ class AutoTradingEngine:
         if snap:
             return snap
         account = self.kis.fetch_account_summary()
+        orderable_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
+        available_cash = float(account.get("available_cash", orderable_cash) or 0)
+        d2_cash = float(account.get("d2_cash", account.get("d2_deposit", 0)) or 0)
+        warning = ""
+        selected_keys = account.get("selected_keys", {}) if isinstance(account.get("selected_keys"), dict) else {}
+        if orderable_cash == 0 and d2_cash > 0:
+            warning = "ORDERABLE_CASH_MAPPING_SUSPECT"
+            logger.warning(
+                "event=ACCOUNT_MAPPING_WARN warning=%s orderable_cash=%s d2_cash=%s selected_keys=%s",
+                warning,
+                int(orderable_cash),
+                int(d2_cash),
+                selected_keys,
+            )
+
+        account["orderable_cash"] = orderable_cash
+        account["available_cash"] = available_cash
+        account["d2_cash"] = d2_cash
+
         positions = self.kis.fetch_positions()
         orders = self.kis.fetch_recent_orders(limit=20)
-        snap = {"account": account, "positions": positions, "orders": orders, "token_status": self.kis.get_token_status(), "throttle": state, "ts": datetime.utcnow().isoformat()}
+        snap = {
+            "account": account,
+            "orderable_cash": orderable_cash,
+            "available_cash": available_cash,
+            "d2_cash": d2_cash,
+            "snapshot_source": "account_summary_v2",
+            "warning": warning,
+            "positions": positions,
+            "orders": orders,
+            "token_status": self.kis.get_token_status(),
+            "throttle": state,
+            "ts": datetime.utcnow().isoformat(),
+        }
         self.portfolio_service.set_cached(snap)
         return snap
 
@@ -398,7 +439,7 @@ class AutoTradingEngine:
     def precheck_manual_buy(self, price: float, qty: int) -> dict[str, Any]:
         self._reload_config()
         account = self.kis.fetch_account_summary()
-        available_cash = float(account.get("available_cash", 0) or 0)
+        available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
         ok, reason, detail = self.check_affordability(price, qty, available_cash)
         return {"ok": ok, "reason": reason, **detail}
 

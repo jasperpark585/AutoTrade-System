@@ -450,6 +450,102 @@ class KISClient:
 
 
 
+    @staticmethod
+    def parse_money(x: Any) -> float:
+        if x is None:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        text = str(x).replace(",", "").strip()
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _pick_money(self, rows: list[dict[str, Any]], keys: list[str]) -> tuple[float, str | None]:
+        for key in keys:
+            for row in rows:
+                if key in row and row.get(key) not in (None, ""):
+                    return self.parse_money(row.get(key)), key
+        return 0.0, None
+
+    def _extract_account_summary(self, data: dict[str, Any]) -> dict[str, Any]:
+        output = data.get("output") if isinstance(data.get("output"), dict) else {}
+        output1 = data.get("output1")
+        output2 = data.get("output2")
+
+        rows: list[dict[str, Any]] = []
+        if output:
+            rows.append(output)
+        if isinstance(output1, dict):
+            rows.append(output1)
+        elif isinstance(output1, list) and output1 and isinstance(output1[0], dict):
+            rows.append(output1[0])
+        if isinstance(output2, dict):
+            rows.append(output2)
+        elif isinstance(output2, list) and output2 and isinstance(output2[0], dict):
+            rows.append(output2[0])
+
+        orderable_keys = [
+            "ord_psbl_cash",
+            "ord_psbl_amt",
+            "ord_psbl_cash_amt",
+            "psbl_cash",
+            "cash_psbl_amt",
+        ]
+        d2_keys = ["nxdy_excc_amt", "d2_auto_rdpt_amt", "prvs_rcdl_excc_amt", "d2_psbl_cash"]
+        cash_keys = ["dnca_tot_amt", "dnca_tot_amt_amt", "tot_dnca_amt"]
+
+        orderable_cash, orderable_key = self._pick_money(rows, orderable_keys)
+        d2_cash, d2_key = self._pick_money(rows, d2_keys)
+        cash, cash_key = self._pick_money(rows, cash_keys)
+
+        fallback_used = False
+        if orderable_cash <= 0 and cash > 0:
+            orderable_cash = cash
+            orderable_key = f"fallback:{cash_key or 'dnca_tot_amt'}"
+            fallback_used = True
+
+        total_eval, total_eval_key = self._pick_money(rows, ["tot_evlu_amt", "scts_evlu_amt", "tot_evlu_pfls_amt"])
+        total_asset, total_asset_key = self._pick_money(rows, ["tot_asst_amt", "asst_icdc_amt"])
+        if total_asset <= 0:
+            total_asset = cash + total_eval
+
+        if str(os.getenv("KIS_DEBUG_RAW", "0")).lower() in {"1", "true", "yes"}:
+            o1_keys = sorted(list(rows[1].keys())) if len(rows) > 1 else []
+            o2_keys = sorted(list(rows[-1].keys())) if rows else []
+            logger.info(
+                "account_summary keys output1=%s output2=%s orderable_key=%s d2_key=%s cash_key=%s fallback_used=%s orderable_cash=%s",
+                o1_keys,
+                o2_keys,
+                orderable_key,
+                d2_key,
+                cash_key,
+                fallback_used,
+                int(orderable_cash),
+            )
+
+        return {
+            "orderable_cash": orderable_cash,
+            "available_cash": orderable_cash,
+            "d2_cash": d2_cash,
+            "d2_deposit": d2_cash,
+            "cash": cash,
+            "total_eval": total_eval,
+            "total_asset": total_asset,
+            "selected_keys": {
+                "orderable_key": orderable_key,
+                "d2_key": d2_key,
+                "cash_key": cash_key,
+                "total_eval_key": total_eval_key,
+                "total_asset_key": total_asset_key,
+                "fallback_used": fallback_used,
+            },
+            "raw_summary": rows[0] if rows else {},
+        }
+
     def fetch_account_summary(self) -> dict[str, Any]:
         return self.get_account_summary()
 
@@ -460,11 +556,14 @@ class KISClient:
         if self.dry_run:
             equity = float(os.getenv("AUTOTRADE_EQUITY_BASE_KRW", "10000000"))
             return {
+                "orderable_cash": equity,
                 "available_cash": equity,
                 "cash": equity,
+                "d2_cash": equity,
                 "d2_deposit": equity,
                 "total_eval": 0.0,
                 "total_asset": equity,
+                "snapshot_source": "dry_run",
                 "mode": "DRY-RUN",
             }
 
@@ -485,45 +584,7 @@ class KISClient:
             "CTX_AREA_NK100": "",
         }
         data = self._request_json("GET", url, headers=headers, params=params)
-        output2 = data.get("output2", [])
-
-        if isinstance(output2, list) and len(output2) > 0:
-            s0 = output2[0]
-        else:
-            s0 = {}
-
-        def to_float(x):
-            if x is None:
-                return 0.0
-            return float(str(x).replace(",", "").strip() or 0)
-
-        available_cash = to_float(
-            s0.get("ord_psbl_cash")
-            or s0.get("ord_psbl_cash_amt")
-            or 0
-        )
-
-        cash = to_float(
-            s0.get("dnca_tot_amt")
-            or s0.get("dnca_tot_amt_amt")
-            or 0
-        )
-        d2_deposit = to_float(s0.get("nxdy_excc_amt") or 0)
-        total_eval = to_float(s0.get("tot_evlu_amt") or 0)
-        total_asset = to_float(s0.get("tot_asst_amt") or (cash + total_eval))
-
-        if os.getenv("KIS_DEBUG_RAW", "false").lower() == "true":
-            logger.info("[ACCOUNT RAW] output2=%s", output2)
-            logger.info("[ACCOUNT PARSED] available_cash=%s, cash=%s", available_cash, cash)
-
-        return {
-            "available_cash": available_cash,
-            "cash": cash,
-            "d2_deposit": d2_deposit,
-            "total_eval": total_eval,
-            "total_asset": total_asset,
-            "raw_summary": s0,
-        }
+        return self._extract_account_summary(data if isinstance(data, dict) else {})
 
     def get_positions(self) -> list[dict[str, Any]]:
         if self.dry_run:
