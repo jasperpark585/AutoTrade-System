@@ -193,3 +193,33 @@ curl http://127.0.0.1:8000/health
 - `data/news_state.json`: 호출 횟수/비용 cap/다음 갱신 시간 상태
 - `data/portfolio_snapshot.json`: 포트폴리오 단기 캐시
 - 파일 쓰기는 임시파일 후 rename(atomic write) 방식으로 처리
+
+## 14) 토큰 쿨다운 발생 시 동작
+
+- KIS 토큰 발급이 `EGW00133`, `403`, `temporarily unavailable`, cooldown 응답일 때 엔진은 **치명오류로 중지하지 않습니다**.
+- 엔진은 blocker를 `KIS_TOKEN_COOLDOWN`으로 기록하고 `next_retry_at` 전까지 tick에서 주문/시세/계좌 호출을 스킵합니다.
+- `/status` 및 UI 운영상태에서 `enabled`, `blocker`, `next_retry_at`, `current_profile`, `orderable_cash`, `candidates_count`, `recent_blockers(최근 5개)`를 확인할 수 있습니다.
+
+## 15) 소액전용 프로필 자동선택
+
+- `orderable_cash < 300,000` 이면 `small_cash_profile` 자동 적용.
+- 적용 시 강제 제한:
+  - 최대 보유종목 수 `1~2`
+  - 1회 최대매수금 `orderable_cash`의 40% (최소 20,000 / 최대 150,000)
+  - 저가 필터(`현재가 <= 80,000`, 1주 매수 가능)
+- 수량 산정은 `orderable_cash`와 `max_buy_amount_per_trade`를 동시에 만족하도록 계산됩니다.
+
+## 16) 서버 적용 절차 (systemd)
+
+```bash
+cd /opt/AutoTrade-System
+source .venv/bin/activate
+python -m compileall app tests
+python -m unittest discover -s tests -v
+sudo systemctl daemon-reload
+sudo systemctl restart autotrade-engine autotrade-ui
+sudo systemctl status autotrade-engine autotrade-ui --no-pager
+sudo journalctl -u autotrade-engine -n 200 --no-pager
+sudo journalctl -u autotrade-engine -f
+curl -s http://127.0.0.1:8000/status | jq .
+```

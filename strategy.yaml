@@ -30,8 +30,8 @@ stages:
     max_spread_pct: 1.2
     use_allowlist: false
     allowlist_symbols:
-    - "005930"
-    - "000660"
+    - 005930
+    - '000660'
     paid_override:
       enabled: false
       min_avg_turnover_krw: null
@@ -80,7 +80,6 @@ stages:
     take_profit_pct: 4.2
     time_based_exit_minutes: 95
     volatility_stop_multiplier: 1.4
-
 news:
   use_news_universe: true
   provider: dummy
@@ -88,3 +87,17 @@ news:
   daily_call_cap: 48
   per_minute_cap: 2
   monthly_cost_cap: 0.0
+small_cash_profile:
+  enabled: true
+  force_enabled: false
+  auto_switch:
+    enabled: true
+    threshold_orderable_cash_krw: 300000
+  overrides:
+    risk_limits:
+      max_positions: 2
+      max_buy_amount_per_trade_krw: 120000
+      max_buy_amount_per_trade: 120000
+    stages:
+      universe:
+        max_price_krw: 80000

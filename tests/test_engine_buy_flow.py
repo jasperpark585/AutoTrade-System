@@ -69,6 +69,18 @@ class EngineBuyFlowTests(unittest.TestCase):
         with self.assertRaises(KISError):
             self.engine._attempt_buy_candidates(candidates)
 
+
+    def test_token_cooldown_does_not_disable_engine(self):
+        self.engine.set_auto_trading_enabled(True)
+
+        def fail_portfolio(*args, **kwargs):
+            raise KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"})
+
+        self.engine.get_portfolio_snapshot = fail_portfolio  # type: ignore[method-assign]
+        self.engine.tick()
+        self.assertTrue(self.engine.get_auto_trading_enabled())
+        self.assertEqual(self.engine.runtime.blocker, "KIS_TOKEN_COOLDOWN")
+
     def test_max_buy_exceeded_skips_candidate(self):
         self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
         self.engine.config["risk_limits"]["max_buy_amount_per_trade_krw"] = 100_000

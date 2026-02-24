@@ -20,7 +20,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     engine: AutoTradingEngine | None = None
 
     def do_GET(self):  # noqa: N802
-        if self.path != "/health":
+        if self.path not in {"/health", "/status"}:
             self.send_response(404)
             self.end_headers()
             return
@@ -40,12 +40,14 @@ def run() -> None:
 
     notifier = KakaoNotifier(token=os.getenv("KAKAO_TOKEN"))
     engine = AutoTradingEngine(cfg_mgr, db, notifier)
-    engine.enable(True)
+    # default is OFF; keep persisted operator selection across restarts
+    if db.get_engine_state("auto_trading_enabled") is None:
+        engine.set_auto_trading_enabled(False)
 
     HealthHandler.engine = engine
     server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info("Health server running on :8000/health")
+    logger.info("Health server running on :8000/health and :8000/status")
 
     while True:
         cfg = cfg_mgr.load()

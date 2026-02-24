@@ -96,7 +96,7 @@ class NewsClient:
 
     def load_candidates(self) -> list[dict[str, Any]]:
         if not self.candidates_path.exists():
-            self.update_candidates(force=True)
+            return []
         try:
             data = json.loads(self.candidates_path.read_text(encoding="utf-8"))
             return data.get("candidates", [])

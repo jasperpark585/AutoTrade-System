@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -103,6 +104,7 @@ class KISClient:
         self._token: str | None = None
         self._token_expire_at: datetime | None = None
         self._token_retry_after_epoch: float = 0.0
+        self._token_lock = threading.Lock()
 
     @retry(
         retry=retry_if_exception_type(KISError),
@@ -334,35 +336,39 @@ class KISClient:
         }
 
     def _get_access_token(self) -> str:
-        now_epoch = datetime.utcnow().timestamp()
-        if self._token and self._token_expire_at and datetime.utcnow() < self._token_expire_at:
+        with self._token_lock:
+            now = datetime.utcnow()
+            now_epoch = now.timestamp()
+            if self._token and self._token_expire_at and now < self._token_expire_at:
+                return self._token
+            if now_epoch < self._token_retry_after_epoch:
+                retry_at = datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()
+                raise KISError("KIS token cooldown active", detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": retry_at})
+
+            url = f"{self.base_url}/oauth2/tokenP"
+            payload = {"grant_type": "client_credentials", "appkey": self.appkey, "appsecret": self.appsecret}
+            if requests is None:
+                raise KISError("requests package is required for LIVE token request")
+            try:
+                resp = requests.post(url, headers={"content-type": "application/json"}, json=payload, timeout=self.timeout)
+            except Exception as exc:
+                self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
+                raise KISError("KIS token request failed", detail={"reason": "KIS_TOKEN_COOLDOWN", "url": url, "error": str(exc), "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()}) from exc
+
+            data = self._safe_json(resp)
+            if resp.status_code != 200 or "access_token" not in data:
+                self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
+                msg = str(data.get("msg1", ""))
+                raise KISError(
+                    "KIS token temporarily unavailable",
+                    detail={"reason": "KIS_TOKEN_COOLDOWN", "http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": msg, "url": url, "raw_response": data, "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()},
+                )
+
+            self._token = data["access_token"]
+            expires_sec = int(data.get("expires_in", 3600))
+            self._token_expire_at = datetime.utcnow() + timedelta(seconds=max(60, expires_sec - 60))
+            self._token_retry_after_epoch = 0.0
             return self._token
-        if now_epoch < self._token_retry_after_epoch:
-            retry_at = datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()
-            raise KISError("KIS token cooldown active", detail={"next_retry_at": retry_at})
-
-        url = f"{self.base_url}/oauth2/tokenP"
-        payload = {"grant_type": "client_credentials", "appkey": self.appkey, "appsecret": self.appsecret}
-        if requests is None:
-            raise KISError("requests package is required for LIVE token request")
-        try:
-            resp = requests.post(url, headers={"content-type": "application/json"}, json=payload, timeout=self.timeout)
-        except Exception as exc:
-            self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
-            raise KISError("KIS token request failed", detail={"url": url, "error": str(exc), "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()}) from exc
-
-        data = self._safe_json(resp)
-        if resp.status_code != 200 or "access_token" not in data:
-            self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
-            raise KISError(
-                "KIS token failed",
-                detail={"http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": data.get("msg1"), "url": url, "raw_response": data, "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()},
-            )
-
-        self._token = data["access_token"]
-        expires_sec = int(data.get("expires_in", 3600))
-        self._token_expire_at = datetime.utcnow() + timedelta(seconds=max(60, expires_sec - 60))
-        return self._token
 
     def _get_hashkey(self, body: dict[str, Any]) -> str:
         url = f"{self.base_url}/uapi/hashkey"
@@ -479,14 +485,36 @@ class KISClient:
             "CTX_AREA_NK100": "",
         }
         data = self._request_json("GET", url, headers=headers, params=params)
-        output2 = data.get("output2", [{}])
-        s0 = output2[0] if output2 else {}
+        output2 = data.get("output2", [])
 
-        available_cash = float(s0.get("ord_psbl_cash", 0) or 0)
-        cash = float(s0.get("dnca_tot_amt", 0) or 0)
-        d2_deposit = float(s0.get("nxdy_excc_amt", 0) or 0)
-        total_eval = float(s0.get("tot_evlu_amt", 0) or 0)
-        total_asset = float(s0.get("tot_asst_amt", 0) or (cash + total_eval))
+        if isinstance(output2, list) and len(output2) > 0:
+            s0 = output2[0]
+        else:
+            s0 = {}
+
+        def to_float(x):
+            if x is None:
+                return 0.0
+            return float(str(x).replace(",", "").strip() or 0)
+
+        available_cash = to_float(
+            s0.get("ord_psbl_cash")
+            or s0.get("ord_psbl_cash_amt")
+            or 0
+        )
+
+        cash = to_float(
+            s0.get("dnca_tot_amt")
+            or s0.get("dnca_tot_amt_amt")
+            or 0
+        )
+        d2_deposit = to_float(s0.get("nxdy_excc_amt") or 0)
+        total_eval = to_float(s0.get("tot_evlu_amt") or 0)
+        total_asset = to_float(s0.get("tot_asst_amt") or (cash + total_eval))
+
+        if os.getenv("KIS_DEBUG_RAW", "false").lower() == "true":
+            logger.info("[ACCOUNT RAW] output2=%s", output2)
+            logger.info("[ACCOUNT PARSED] available_cash=%s, cash=%s", available_cash, cash)
 
         return {
             "available_cash": available_cash,
@@ -582,6 +610,16 @@ class KISClient:
                 }
             )
         return out
+
+    def get_token_status(self) -> dict[str, Any]:
+        now_epoch = datetime.utcnow().timestamp()
+        cooldown = self._token_retry_after_epoch > now_epoch
+        return {
+            "has_token": bool(self._token),
+            "token_expire_at": self._token_expire_at.isoformat() if self._token_expire_at else None,
+            "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat() if self._token_retry_after_epoch else None,
+            "cooldown_active": cooldown,
+        }
 
     def _request_json(self, method: str, url: str, headers: dict[str, str], params: dict[str, Any] | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if requests is None:
