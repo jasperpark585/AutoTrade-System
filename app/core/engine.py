@@ -269,7 +269,6 @@ class AutoTradingEngine:
         if max_buy > 0 and estimated_cost > max_buy:
             return False, "MAX_BUY_EXCEEDED", detail
         return True, "OK", detail
-
     def get_buy_candidates_preview(self, top_n: int = 10) -> list[dict[str, Any]]:
         self._reload_config()
         quotes, score_map = self._load_universe_quotes()

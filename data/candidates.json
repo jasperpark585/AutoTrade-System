@@ -1,0 +1,41 @@
+{
+  "updated_at": "2026-02-24T00:13:08.676611",
+  "candidates": [
+    {
+      "symbol": "005930",
+      "score": 21,
+      "reasons": {
+        "positive_news": 5,
+        "negative_news": 1,
+        "keyword_match": 3,
+        "recency": 5,
+        "source_count": 4
+      },
+      "updated_at": "2026-02-24T00:13:08.675536"
+    },
+    {
+      "symbol": "000660",
+      "score": 16,
+      "reasons": {
+        "positive_news": 4,
+        "negative_news": 1,
+        "keyword_match": 2,
+        "recency": 4,
+        "source_count": 3
+      },
+      "updated_at": "2026-02-24T00:13:08.675540"
+    },
+    {
+      "symbol": "035420",
+      "score": 12,
+      "reasons": {
+        "positive_news": 3,
+        "negative_news": 2,
+        "keyword_match": 2,
+        "recency": 4,
+        "source_count": 2
+      },
+      "updated_at": "2026-02-24T00:13:08.675542"
+    }
+  ]
+}
