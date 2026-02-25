@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from app.core.config import ConfigManager
@@ -53,7 +55,23 @@ class AutoTradingEngine:
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self._reload_config()
+        self._check_runtime_writable_paths()
         self._restore_last_good_orderable(source="cached")
+
+
+    def _check_runtime_writable_paths(self) -> None:
+        targets = [Path("data"), Path("logs"), Path("strategy.yaml")]
+        for target in targets:
+            try:
+                parent = target if target.is_dir() else target.parent
+                parent.mkdir(parents=True, exist_ok=True)
+                writable = os.access(parent, os.W_OK)
+                if target.exists() and target.is_file():
+                    writable = writable and os.access(target, os.W_OK)
+                if not writable:
+                    logger.warning("event=PERMISSION_WARN path=%s writable=%s", target, writable)
+            except Exception as exc:
+                logger.warning("event=PERMISSION_WARN path=%s error=%s", target, exc)
 
     def _reload_config(self) -> None:
         self.base_config = self.cfg_mgr.load()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from io import StringIO
 
@@ -30,10 +31,35 @@ st.set_page_config(page_title="국내주식 완전자동 매매", layout="wide")
 cfg_mgr = ConfigManager()
 db = Database()
 engine = AutoTradingEngine(cfg_mgr, db, KakaoNotifier(token=os.getenv("KAKAO_TOKEN")))
+logger = logging.getLogger(__name__)
+
+
+def _can_write_target(path: str) -> bool:
+    p = os.path.abspath(path)
+    parent = os.path.dirname(p) if os.path.splitext(p)[1] else p
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except Exception:
+        return False
+    if os.path.isfile(p):
+        return os.access(p, os.W_OK)
+    return os.access(parent, os.W_OK)
+
+
+WRITE_ENABLED = all([
+    _can_write_target("data"),
+    _can_write_target("logs"),
+    _can_write_target("strategy.yaml"),
+])
+if not WRITE_ENABLED:
+    logger.warning("event=UI_PERMISSION_WARN writable=false targets=data/logs/strategy.yaml")
 
 st.title("국내주식 완전자동 매매 시스템")
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["운영 상태", "포트폴리오", "전략 설정", "환경변수", "리포트", "수동 진행/자동매매진단"])
+
+if not WRITE_ENABLED:
+    st.warning("읽기 전용 환경 감지: data/logs/strategy.yaml 쓰기 권한 없음. 토글/저장/수동갱신이 비활성화됩니다.")
 
 
 def _mask_env(value: str | None) -> str:
@@ -47,10 +73,20 @@ def _mask_env(value: str | None) -> str:
 def _show_toggle_status() -> None:
     hb = engine.heartbeat()
     current = bool(hb.get("enabled", False))
-    toggled = st.toggle("자동매매 ON/OFF", value=current)
+    if "auto_trade_toggle" not in st.session_state:
+        st.session_state["auto_trade_toggle"] = current
+    toggled = st.toggle("자동매매 ON/OFF", value=bool(st.session_state.get("auto_trade_toggle", current)), key="auto_trade_toggle", disabled=not WRITE_ENABLED)
     if toggled != current:
-        engine.set_auto_trading_enabled(toggled)
-        st.success(f"자동매매 {'ON' if toggled else 'OFF'} 저장 완료")
+        try:
+            engine.set_auto_trading_enabled(toggled)
+            st.success(f"자동매매 {'ON' if toggled else 'OFF'} 저장 완료")
+        except Exception as exc:
+            st.session_state["auto_trade_toggle"] = current
+            err_type, message, detail = unwrap_exception(exc)
+            st.warning(f"DB write failed(권한/readonly): [{err_type}] {message}")
+            if detail:
+                with st.expander("상세"):
+                    st.json(detail)
     hb = engine.heartbeat()
     if hb.get("enabled") and hb.get("blocker"):
         st.warning(f"자동매매는 ON이지만 현재 차단중: {hb.get('blocker')} (next_retry_at={hb.get('next_retry_at')})")
@@ -67,7 +103,7 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
 
     cooldown_active = hb.get("blocker") == "KIS_TOKEN_COOLDOWN"
     refresh_disabled = bool(cooldown_active and hb.get("next_retry_at"))
-    if st.button("포트폴리오 수동 갱신", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}", disabled=refresh_disabled):
+    if st.button("포트폴리오 수동 갱신", key=f"refresh_portfolio_{'tab' if include_controls else 'inline'}", disabled=(refresh_disabled or not WRITE_ENABLED)):
         if requests is None:
             st.warning("requests 패키지가 없어 엔진 API 호출을 수행할 수 없습니다.")
         else:
@@ -149,9 +185,16 @@ with tab3:
     cfg["scan_interval_seconds"] = st.slider("스캔 주기(초)", 30, 120, int(cfg["scan_interval_seconds"]))
     for key, val in cfg["risk_limits"].items():
         cfg["risk_limits"][key] = st.number_input(f"risk_limits.{key}", value=float(val), key=f"risk_{key}")
-    if st.button("전략 저장(핫리로드)"):
-        cfg_mgr.save(cfg)
-        st.success("저장 완료")
+    if st.button("전략 저장(핫리로드)", disabled=not WRITE_ENABLED):
+        try:
+            cfg_mgr.save(cfg)
+            st.success("저장 완료")
+        except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
+            st.warning(f"전략 저장 실패(DB/파일 권한): [{err_type}] {message}")
+            if detail:
+                with st.expander("상세"):
+                    st.json(detail)
 
 with tab4:
     st.subheader("환경변수(.env) 기반 시크릿 상태")

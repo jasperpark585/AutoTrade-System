@@ -223,3 +223,23 @@ sudo journalctl -u autotrade-engine -n 200 --no-pager
 sudo journalctl -u autotrade-engine -f
 curl -s http://127.0.0.1:8000/status | jq .
 ```
+
+
+## 17) UI 안정성 스모크 테스트(쿨다운/권한)
+
+```bash
+# 1) 기본 확인
+python -m compileall app tests
+python -m unittest discover -s tests -v
+
+# 2) 엔진/상태 확인
+curl -s http://127.0.0.1:8000/status | head -200
+
+# 3) readonly 시뮬레이션(운영 전 테스트 환경에서만)
+chmod -R a-w data logs || true
+# UI에서 토글/전략저장이 비활성화되고 경고만 표시되는지 확인
+chmod -R u+w data logs || true
+```
+
+- KIS_TOKEN_COOLDOWN 상황에서도 UI는 종료되지 않고 경고 배너와 `next_retry_at`만 표시합니다.
+- DB/파일이 readonly이면 UI는 토글/저장/수동갱신을 자동 비활성화합니다.
