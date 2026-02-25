@@ -165,7 +165,21 @@ class AutoTradingEngine:
         self.db.set_engine_state("last_good_orderable_at", ts)
         self.runtime.orderable_cash_last_updated_at = ts
 
+    def get_runtime_mode_flags(self) -> dict[str, Any]:
+        mode = str(self.config.get("mode", "DRY-RUN")).upper()
+        env_dry = str(os.getenv("DRY_RUN", "false")).lower() in {"1", "true", "yes", "on"}
+        kis_dry = bool(getattr(self.kis, "dry_run", mode != "LIVE"))
+        mock_order = bool(getattr(self.kis, "mock_live_order", False))
+        live_order_enabled = mode == "LIVE" and (not env_dry) and (not kis_dry) and (not mock_order)
+        return {
+            "mode": mode,
+            "dry_run": bool(env_dry or kis_dry),
+            "mock_order": mock_order,
+            "live_order_enabled": live_order_enabled,
+        }
+
     def heartbeat(self) -> dict[str, Any]:
+        flags = self.get_runtime_mode_flags()
         return {
             "enabled": self.get_auto_trading_enabled(),
             "fatal_error": self.runtime.fatal_error,
@@ -184,6 +198,10 @@ class AutoTradingEngine:
             "open_positions": len(self.runtime.open_positions),
             "daily_trades": self.runtime.daily_trades,
             "daily_loss_krw": self.runtime.daily_loss_krw,
+            "mode": flags["mode"],
+            "dry_run": flags["dry_run"],
+            "mock_order": flags["mock_order"],
+            "live_order_enabled": flags["live_order_enabled"],
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -470,8 +488,11 @@ class AutoTradingEngine:
         snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
         return snap
 
+    def clear_report_data(self, only_dry: bool = True, vacuum: bool = False) -> dict[str, Any]:
+        return self.db.clear_report_data(only_dry=only_dry, vacuum=vacuum)
+
     def _is_live_mode(self) -> bool:
-        return str(self.config.get("mode", "DRY-RUN")).upper() == "LIVE"
+        return bool(self.get_runtime_mode_flags().get("live_order_enabled"))
 
     def refresh_portfolio_snapshot(self, force: bool = False, trigger: str = "manual") -> dict[str, Any]:
         self._reload_config()

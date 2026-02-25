@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 DB_PATH = Path("data/autotrade.db")
+logger = logging.getLogger(__name__)
 
 
 class Database:
     def __init__(self, path: Path = DB_PATH) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(self.path.parent, os.W_OK):
+            logger.warning("event=DB_PERMISSION_WARN path=%s writable=false", self.path.parent)
         self._init_db()
 
     @contextmanager
@@ -59,6 +65,69 @@ class Database:
                 );
                 """
             )
+
+    def list_tables(self) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        return {str(r["name"]) for r in rows}
+
+    def get_table_columns(self, table_name: str) -> set[str]:
+        with self.connect() as con:
+            rows = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(r["name"]).lower() for r in rows}
+
+    @staticmethod
+    def _dry_filter_clause(columns: set[str]) -> str | None:
+        if "is_dry_run" in columns:
+            return "is_dry_run = 1"
+        if "dry_run" in columns:
+            return "dry_run = 1"
+        if "mode" in columns:
+            return "UPPER(mode) IN ('DRY','DRY-RUN','DRY_RUN','PAPER')"
+        return None
+
+    def clear_report_data(self, only_dry: bool = True, vacuum: bool = False) -> dict[str, Any]:
+        allowlist = {
+            "signals": {"default_where": None},
+            "trades": {"default_where": "status='CLOSED'"},
+            "performance_reports": {"default_where": None},
+            "daily_performance": {"default_where": None},
+            "report_cache": {"default_where": None},
+        }
+
+        existing = self.list_tables()
+        deleted: dict[str, int] = {}
+        skipped: list[str] = []
+
+        with self.connect() as con:
+            for table, spec in allowlist.items():
+                if table not in existing:
+                    skipped.append(table)
+                    continue
+
+                cols = self.get_table_columns(table)
+                where_clause = spec["default_where"]
+                dry_clause = self._dry_filter_clause(cols) if only_dry else None
+
+                if dry_clause:
+                    where_clause = dry_clause
+
+                sql = f"DELETE FROM {table}"
+                if where_clause:
+                    sql += f" WHERE {where_clause}"
+
+                cur = con.execute(sql)
+                deleted[table] = int(cur.rowcount or 0)
+
+            if vacuum:
+                con.execute("VACUUM")
+
+        return {
+            "deleted": deleted,
+            "skipped": skipped,
+            "vacuum": vacuum,
+            "only_dry": only_dry,
+        }
 
     def insert_signal(self, symbol: str, total_score: float, stage_scores: str, pass_fail: str, reason: str) -> None:
         with self.connect() as con:
@@ -114,7 +183,6 @@ class Database:
             if not row:
                 return default
             return str(row["value"])
-
 
     def set_engine_state_float(self, key: str, value: float) -> None:
         self.set_engine_state(key, f"{float(value):.6f}")
