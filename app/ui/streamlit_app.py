@@ -163,15 +163,34 @@ with tab1:
     status = get_market_status()
     st.subheader("장 상태")
     st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
-    st.subheader("엔진 상태")
-    st.json(engine.heartbeat())
-    _show_portfolio(force_refresh=False, include_controls=False)
 
-    signals = db.fetch_df("SELECT created_at, symbol, total_score, stage_scores, pass_fail, reason FROM signals ORDER BY id DESC LIMIT 50")
-    if not signals.empty:
-        signals["stage_scores"] = signals["stage_scores"].apply(lambda x: json.loads(x))
-    st.subheader("최근 종목 점수/근거")
-    st.dataframe(signals, use_container_width=True)
+    st.subheader("운영 상태 / 시스템 상태")
+    try:
+        hb = engine.heartbeat()
+        sanitized_status = {
+            "health": "ok",
+            "enabled": hb.get("enabled"),
+            "current_profile": hb.get("current_profile"),
+            "blocker": hb.get("blocker"),
+            "next_retry_at": hb.get("next_retry_at"),
+            "recent_blockers": hb.get("recent_blockers", []),
+            "candidates_count": hb.get("candidates_count"),
+            "open_positions_count": hb.get("open_positions"),
+            "daily_trades": hb.get("daily_trades"),
+            "daily_loss_flag": bool(float(hb.get("daily_loss_krw", 0) or 0) < 0),
+            "last_tick_time": hb.get("timestamp"),
+            "orderable_cash_visible": "masked",
+            "portfolio_visible": "masked",
+        }
+        st.json(sanitized_status)
+    except Exception as exc:
+        err_type, message, detail = unwrap_exception(exc)
+        st.warning(f"운영 상태 로드 실패 [{err_type}]: {message}")
+        if detail:
+            with st.expander("상세"):
+                st.json(detail)
+
+    st.info("운영 상태 탭에서는 실계좌 금액/보유종목/주문내역을 표시하지 않습니다. 실계좌 정보는 포트폴리오 탭에서 확인하세요.")
 
 with tab2:
     st.subheader("포트폴리오")
