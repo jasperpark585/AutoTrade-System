@@ -127,6 +127,21 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertIn(self.engine.runtime.orderable_cash_source, {"cached", "available_cash", "ord_psbl_cash"})
         self.assertEqual(self.engine.db.get_engine_state_float("last_good_orderable_cash"), 120398.0)
 
+    @patch("app.core.engine.get_market_status")
+    def test_cooldown_sets_transient_blocker_not_fatal(self, mock_market):
+        mock_market.return_value = type("S", (), {"can_place_order": True, "reason": "장중", "is_open": True})()
+        self.engine.set_auto_trading_enabled(True)
+        self.engine._is_live_mode = Mock(return_value=True)  # type: ignore[method-assign]
+        self.engine.refresh_portfolio_snapshot = Mock(side_effect=KISError("cooldown", detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "http_status": 403}))  # type: ignore[method-assign]
+
+        self.engine.tick()
+
+        hb = self.engine.heartbeat()
+        self.assertTrue(hb["enabled"])
+        self.assertEqual(hb["blocker"], "KIS_TOKEN_COOLDOWN")
+        self.assertEqual(hb["next_retry_at"], "2099-01-01T00:00:00")
+        self.assertFalse(bool(hb["fatal_error"]))
+
     def test_max_buy_exceeded_skips_candidate(self):
         self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
         self.engine.config["risk_limits"]["max_buy_amount_per_trade_krw"] = 100_000

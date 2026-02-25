@@ -21,6 +21,7 @@ from app.core.engine import AutoTradingEngine
 from app.core.market_hours import get_market_status
 from app.core.reporting import aggregate_performance, load_closed_trades, symbol_contribution
 from app.services.kakao import KakaoNotifier
+from app.ui.time_utils import format_retry_time_kst
 from app.utils.errors import unwrap_exception
 
 try:
@@ -184,9 +185,12 @@ def _is_snapshot_valid(snap: dict[str, Any] | None) -> bool:
 
 
 def _remember_portfolio_snapshot(snap: dict[str, Any], source: str) -> None:
+    updated_at = snap.get("ts") or time.strftime("%Y-%m-%dT%H:%M:%S")
     st.session_state["portfolio_last_success"] = snap
-    st.session_state["portfolio_last_success_at"] = snap.get("ts") or time.strftime("%Y-%m-%dT%H:%M:%S")
+    st.session_state["portfolio_last_success_at"] = updated_at
     st.session_state["portfolio_last_success_source"] = source
+    st.session_state["portfolio_snapshot"] = snap
+    st.session_state["portfolio_snapshot_updated_at"] = updated_at
 
 
 def _show_toggle_status() -> None:
@@ -240,6 +244,7 @@ def _show_portfolio(include_controls: bool = False) -> None:
                     _remember_portfolio_snapshot(snap, "engine_api")
                     st.success(f"포트폴리오 갱신 완료 source={result.get('source')} last_updated={snap.get('ts')}")
                 else:
+                    st.session_state["portfolio_last_error"] = result
                     st.warning(f"포트폴리오 갱신 실패/제한: reason={result.get('reason')} next_retry_at={result.get('next_retry_at')}")
 
     current_snap = ttl_cache_call("portfolio_cached", 30, lambda: engine.get_cached_portfolio_snapshot() or {}, "포트폴리오", default={}) or {}
@@ -265,6 +270,12 @@ def _show_portfolio(include_controls: bool = False) -> None:
 
     if using_last:
         st.warning("현재 실시간 갱신 실패 → 마지막 성공값 표시중")
+        last_err = st.session_state.get("portfolio_last_error")
+        if isinstance(last_err, dict):
+            retry = last_err.get("next_retry_at")
+            if retry:
+                kst, utc = format_retry_time_kst(str(retry))
+                st.caption(f"Next retry (KST): {kst} (UTC: {utc})")
     elif st.session_state.get("portfolio_last_success_source") == "snapshot_file":
         st.warning("엔진 API 연결 실패 → 파일 스냅샷 fallback 표시중")
 
@@ -284,6 +295,9 @@ def _show_portfolio(include_controls: bool = False) -> None:
     c4.metric("총 손익/수익률", f"{total_pnl:,.0f}원 / {total_ret:.2f}%")
 
     st.caption(f"source={source} stale={hb.get('orderable_cash_stale')} last_updated={hb.get('orderable_cash_last_updated_at')}")
+    if hb.get("next_retry_at"):
+        kst, utc = format_retry_time_kst(str(hb.get("next_retry_at")))
+        st.caption(f"Next retry (KST): {kst} (UTC: {utc})")
     st.markdown("#### 보유종목")
     st.dataframe(pd.DataFrame(show_snap.get("positions", [])), use_container_width=True)
     st.markdown("#### 주문/체결(최근 N건)")
@@ -298,13 +312,22 @@ def _show_report_clear_controls() -> None:
     vacuum = st.checkbox("삭제 후 VACUUM 실행(선택)", value=False, key="report_clear_vacuum")
 
     if st.button("테스트 기록 삭제 실행", disabled=(not agree or not WRITE_ENABLED), key="report_clear_button"):
-        result = safe_call(lambda: engine.clear_report_data(only_dry=only_dry, vacuum=vacuum), "리포트 데이터 삭제", default=None)
-        if not result:
+        try:
+            result = engine.clear_report_data(only_dry=only_dry, vacuum=vacuum)
+        except Exception as exc:
+            err_type, message, detail = unwrap_exception(exc)
+            st.error(f"리포트 데이터 삭제 실패: [{err_type}] {message}")
+            if detail:
+                st.caption(str(detail))
             return
+
         deleted = result.get("deleted", {})
         skipped = result.get("skipped", [])
+        msg = result.get("message", "")
         summary = ", ".join([f"{t}:{c}건" for t, c in deleted.items()]) if deleted else "삭제된 데이터 없음"
         st.success(f"리포트 관련 데이터 삭제 완료 - {summary}")
+        if msg:
+            st.caption(f"message: {msg}")
         if skipped:
             st.caption(f"존재하지 않아 건너뜀: {', '.join(skipped)}")
 

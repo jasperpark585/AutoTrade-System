@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -22,8 +23,13 @@ class Database:
 
     @contextmanager
     def connect(self):
-        con = sqlite3.connect(self.path)
+        con = sqlite3.connect(self.path, timeout=5.0)
         con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
         try:
             yield con
             con.commit()
@@ -99,34 +105,55 @@ class Database:
         deleted: dict[str, int] = {}
         skipped: list[str] = []
 
-        with self.connect() as con:
-            for table, spec in allowlist.items():
-                if table not in existing:
-                    skipped.append(table)
-                    continue
+        if not any(t in existing for t in allowlist):
+            return {
+                "deleted": {},
+                "skipped": list(allowlist.keys()),
+                "vacuum": False,
+                "only_dry": only_dry,
+                "message": "nothing to delete",
+            }
 
-                cols = self.get_table_columns(table)
-                where_clause = spec["default_where"]
-                dry_clause = self._dry_filter_clause(cols) if only_dry else None
+        def _run_delete() -> None:
+            with self.connect() as con:
+                for table, spec in allowlist.items():
+                    if table not in existing:
+                        skipped.append(table)
+                        continue
 
-                if dry_clause:
-                    where_clause = dry_clause
+                    cols = self.get_table_columns(table)
+                    where_clause = spec["default_where"]
+                    dry_clause = self._dry_filter_clause(cols) if only_dry else None
 
-                sql = f"DELETE FROM {table}"
-                if where_clause:
-                    sql += f" WHERE {where_clause}"
+                    if dry_clause:
+                        where_clause = dry_clause
 
-                cur = con.execute(sql)
-                deleted[table] = int(cur.rowcount or 0)
+                    sql = f"DELETE FROM {table}"
+                    if where_clause:
+                        sql += f" WHERE {where_clause}"
 
-            if vacuum:
-                con.execute("VACUUM")
+                    cur = con.execute(sql)
+                    deleted[table] = int(cur.rowcount or 0)
 
+                if vacuum:
+                    con.execute("VACUUM")
+
+        for attempt in range(3):
+            try:
+                _run_delete()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 2:
+                    raise
+                time.sleep(0.2 * (attempt + 1))
+
+        message = "nothing to delete" if sum(deleted.values()) == 0 else "deleted"
         return {
             "deleted": deleted,
             "skipped": skipped,
             "vacuum": vacuum,
             "only_dry": only_dry,
+            "message": message,
         }
 
     def insert_signal(self, symbol: str, total_score: float, stage_scores: str, pass_fail: str, reason: str) -> None:

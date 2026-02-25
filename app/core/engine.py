@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +15,7 @@ from app.core.database import Database
 from app.core.market_hours import get_market_status
 from app.core.strategy import ScoreResult, StageStrategy
 from app.services.kakao import KakaoNotifier
-from app.services.kis_client import KISClient, KISError, Quote
+from app.services.kis_client import KISClient, KISCooldownError, KISError, Quote
 from app.services.news_client import NewsClient
 from app.services.portfolio_service import PortfolioService
 from app.utils.errors import unwrap_exception
@@ -107,7 +107,22 @@ class AutoTradingEngine:
         self.runtime.blocker = ""
         self.runtime.blocker_next_retry_at = None
 
+    @staticmethod
+    def _parse_iso_utc(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
     def _is_temporary_kis_error(self, exc: Exception) -> tuple[bool, str | None]:
+        if isinstance(exc, KISCooldownError):
+            detail = exc.detail or {}
+            return True, str(detail.get("next_retry_at") or "") or None
         if not isinstance(exc, KISError):
             return False, None
         detail = exc.detail or {}
@@ -241,7 +256,8 @@ class AutoTradingEngine:
         if not self.runtime.enabled:
             logger.info("tick skip reason=DISABLED")
             return
-        if self.runtime.blocker_next_retry_at and datetime.utcnow().isoformat() < self.runtime.blocker_next_retry_at:
+        retry_dt = self._parse_iso_utc(self.runtime.blocker_next_retry_at)
+        if retry_dt and datetime.now(timezone.utc) < retry_dt:
             logger.info("tick skip reason=%s next_retry_at=%s", self.runtime.blocker, self.runtime.blocker_next_retry_at)
             return
 
@@ -267,6 +283,7 @@ class AutoTradingEngine:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self.runtime.fatal_error = None
                 self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return
@@ -299,6 +316,7 @@ class AutoTradingEngine:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self.runtime.fatal_error = None
                 self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return

@@ -50,6 +50,10 @@ class KISError(RuntimeError):
         return {"error_type": type(self).__name__, "message": str(self), "detail": self.detail}
 
 
+class KISCooldownError(KISError):
+    """Transient cooldown error raised when KIS token/API is temporarily blocked."""
+
+
 @dataclass
 class Quote:
     symbol: str
@@ -343,7 +347,7 @@ class KISClient:
                 return self._token
             if now_epoch < self._token_retry_after_epoch:
                 retry_at = datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()
-                raise KISError("KIS token cooldown active", detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": retry_at})
+                raise KISCooldownError("KIS token cooldown active", detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": retry_at, "http_status": 403})
 
             url = f"{self.base_url}/oauth2/tokenP"
             payload = {"grant_type": "client_credentials", "appkey": self.appkey, "appsecret": self.appsecret}
@@ -353,13 +357,13 @@ class KISClient:
                 resp = requests.post(url, headers={"content-type": "application/json"}, json=payload, timeout=self.timeout)
             except Exception as exc:
                 self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
-                raise KISError("KIS token request failed", detail={"reason": "KIS_TOKEN_COOLDOWN", "url": url, "error": str(exc), "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()}) from exc
+                raise KISCooldownError("KIS token request failed", detail={"reason": "KIS_TOKEN_COOLDOWN", "url": url, "error": str(exc), "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat(), "http_status": 403}) from exc
 
             data = self._safe_json(resp)
             if resp.status_code != 200 or "access_token" not in data:
                 self._token_retry_after_epoch = datetime.utcnow().timestamp() + 60
                 msg = str(data.get("msg1", ""))
-                raise KISError(
+                raise KISCooldownError(
                     "KIS token temporarily unavailable",
                     detail={"reason": "KIS_TOKEN_COOLDOWN", "http_status": resp.status_code, "rt_cd": data.get("rt_cd"), "msg1": msg, "url": url, "raw_response": data, "next_retry_at": datetime.utcfromtimestamp(self._token_retry_after_epoch).isoformat()},
                 )

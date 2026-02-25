@@ -243,3 +243,14 @@ chmod -R u+w data logs || true
 
 - KIS_TOKEN_COOLDOWN 상황에서도 UI는 종료되지 않고 경고 배너와 `next_retry_at`만 표시합니다.
 - DB/파일이 readonly이면 UI는 토글/저장/수동갱신을 자동 비활성화합니다.
+
+
+### 재시작 체크(운영 반영 빠른 절차)
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart autotrade-engine
+sudo systemctl restart autotrade-ui
+curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8000/status
+```
