@@ -32,6 +32,7 @@ cfg_mgr = ConfigManager()
 db = Database()
 engine = AutoTradingEngine(cfg_mgr, db, KakaoNotifier(token=os.getenv("KAKAO_TOKEN")))
 logger = logging.getLogger(__name__)
+LOG_PATH_HINT = "/opt/AutoTrade-System/logs/engine.out.log, /opt/AutoTrade-System/logs/engine.err.log"
 
 
 def _can_write_target(path: str) -> bool:
@@ -70,8 +71,31 @@ def _mask_env(value: str | None) -> str:
     return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
 
 
+def _show_data_refresh_error(exc: Exception) -> None:
+    err_type, message, detail = unwrap_exception(exc)
+    combined = " ".join([
+        str(err_type or ""),
+        str(message or ""),
+        str(detail or ""),
+    ]).lower()
+    if any(token in combined for token in ["cooldown", "token", "retryerror"]):
+        reason = "토큰 쿨다운"
+    elif any(token in combined for token in ["market", "장", "closed", "휴장"]):
+        reason = "장상태"
+    elif any(token in combined for token in ["network", "timeout", "connection", "http"]):
+        reason = "네트워크"
+    else:
+        reason = "일시적 시스템 오류"
+    st.error(f"데이터 갱신 실패(사유: {reason}).")
+    st.caption(f"상세 원인은 서버 로그를 확인하세요: {LOG_PATH_HINT}")
+
+
 def _show_toggle_status() -> None:
-    hb = engine.heartbeat()
+    try:
+        hb = engine.heartbeat()
+    except Exception as exc:
+        _show_data_refresh_error(exc)
+        return
     current = bool(hb.get("enabled", False))
     if "auto_trade_toggle" not in st.session_state:
         st.session_state["auto_trade_toggle"] = current
@@ -82,18 +106,23 @@ def _show_toggle_status() -> None:
             st.success(f"자동매매 {'ON' if toggled else 'OFF'} 저장 완료")
         except Exception as exc:
             st.session_state["auto_trade_toggle"] = current
-            err_type, message, detail = unwrap_exception(exc)
-            st.warning(f"DB write failed(권한/readonly): [{err_type}] {message}")
-            if detail:
-                with st.expander("상세"):
-                    st.json(detail)
-    hb = engine.heartbeat()
+            _show_data_refresh_error(exc)
+    try:
+        hb = engine.heartbeat()
+    except Exception as exc:
+        _show_data_refresh_error(exc)
+        return
     if hb.get("enabled") and hb.get("blocker"):
         st.warning(f"자동매매는 ON이지만 현재 차단중: {hb.get('blocker')} (next_retry_at={hb.get('next_retry_at')})")
 
 
 def _show_portfolio(force_refresh: bool = False, include_controls: bool = False) -> None:
-    hb = engine.heartbeat()
+    del force_refresh
+    try:
+        hb = engine.heartbeat()
+    except Exception as exc:
+        _show_data_refresh_error(exc)
+        return
     if include_controls:
         c1, c2 = st.columns([1, 2])
         auto_on = c1.checkbox("자동 갱신", value=False, key="portfolio_auto")
@@ -118,10 +147,7 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
                     with st.expander("상세"):
                         st.json(result)
             except Exception as exc:
-                err_type, message, detail = unwrap_exception(exc)
-                st.warning(f"포트폴리오 갱신 호출 실패 [{err_type}]: {message}")
-                with st.expander("상세"):
-                    st.json(detail or {})
+                _show_data_refresh_error(exc)
 
     if refresh_disabled:
         st.warning(f"KIS token cooldown active. next_retry_at={hb.get('next_retry_at')} (UI는 KIS 직접 호출 없이 엔진 API/캐시만 사용)")
@@ -152,17 +178,17 @@ def _show_portfolio(force_refresh: bool = False, include_controls: bool = False)
         if snap.get("warning") == "ORDERABLE_CASH_MAPPING_SUSPECT" or hb.get("snapshot_warning") == "ORDERABLE_CASH_MAPPING_SUSPECT":
             st.warning("주문가능금액 매핑 의심: KIS 응답 키 확인 필요(디버그 로그 참조).")
     except Exception as exc:
-        err_type, message, detail = unwrap_exception(exc)
-        st.error(f"포트폴리오 조회 실패 [{err_type}]: {message}")
-        if detail:
-            st.json(detail)
+        _show_data_refresh_error(exc)
 
 
 with tab1:
     _show_toggle_status()
-    status = get_market_status()
     st.subheader("장 상태")
-    st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
+    try:
+        status = get_market_status()
+        st.write({"is_open": status.is_open, "can_place_order": status.can_place_order, "reason": status.reason})
+    except Exception as exc:
+        _show_data_refresh_error(exc)
 
     st.subheader("운영 상태 / 시스템 상태")
     try:
@@ -175,20 +201,14 @@ with tab1:
             "next_retry_at": hb.get("next_retry_at"),
             "recent_blockers": hb.get("recent_blockers", []),
             "candidates_count": hb.get("candidates_count"),
-            "open_positions_count": hb.get("open_positions"),
+            "open_positions": hb.get("open_positions"),
             "daily_trades": hb.get("daily_trades"),
             "daily_loss_flag": bool(float(hb.get("daily_loss_krw", 0) or 0) < 0),
             "last_tick_time": hb.get("timestamp"),
-            "orderable_cash_visible": "masked",
-            "portfolio_visible": "masked",
         }
         st.json(sanitized_status)
     except Exception as exc:
-        err_type, message, detail = unwrap_exception(exc)
-        st.warning(f"운영 상태 로드 실패 [{err_type}]: {message}")
-        if detail:
-            with st.expander("상세"):
-                st.json(detail)
+        _show_data_refresh_error(exc)
 
     st.info("운영 상태 탭에서는 실계좌 금액/보유종목/주문내역을 표시하지 않습니다. 실계좌 정보는 포트폴리오 탭에서 확인하세요.")
 
@@ -217,8 +237,9 @@ with tab3:
 
 with tab4:
     st.subheader("환경변수(.env) 기반 시크릿 상태")
-    env_keys = ["KIS_APPKEY", "KIS_APPSECRET", "KIS_ACCOUNT_NO", "KAKAO_TOKEN", "NEWS_API_KEY"]
-    st.table({"key": env_keys, "value(masked)": [_mask_env(os.getenv(k)) for k in env_keys]})
+    visible_keys = ["AUTOTRADE_ENV", "AUTOTRADE_REGION", "LOG_LEVEL"]
+    st.table({"key": visible_keys, "status": ["present" if os.getenv(k) else "not set" for k in visible_keys]})
+    st.caption("보안을 위해 계좌번호/앱키/토큰 등 민감 환경변수 항목은 UI에서 숨김 처리됩니다.")
 
 with tab5:
     st.subheader("성과 리포트")
@@ -238,18 +259,12 @@ with tab6:
         try:
             st.write(engine.refresh_news_candidates(force=True))
         except Exception as exc:
-            err_type, message, detail = unwrap_exception(exc)
-            st.error(f"뉴스 후보 갱신 실패 [{err_type}]: {message}")
-            if detail:
-                st.json(detail)
+            _show_data_refresh_error(exc)
 
     try:
         st.write(engine.get_news_status())
     except Exception as exc:
-        err_type, message, detail = unwrap_exception(exc)
-        st.error(f"뉴스 상태 조회 실패 [{err_type}]: {message}")
-        if detail:
-            st.json(detail)
+        _show_data_refresh_error(exc)
 
     try:
         preview = engine.get_buy_candidates_preview(top_n=20)
@@ -273,9 +288,4 @@ with tab6:
                 st.caption(f"last_updated_at: {last_updated_at}")
                 st.caption(f"next_update_at: {next_update_at}")
     except Exception as exc:
-        err_type, message, detail = unwrap_exception(exc)
-        st.error(f"KIS token cooldown active: {message}")
-        if detail and isinstance(detail, dict) and detail.get("next_retry_at"):
-            st.caption(f"next_retry_at: {detail.get('next_retry_at')}")
-        if detail:
-            st.json(detail)
+        _show_data_refresh_error(exc)
