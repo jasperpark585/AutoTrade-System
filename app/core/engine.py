@@ -3,9 +3,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from app.core.config import ConfigManager
@@ -32,8 +34,15 @@ class EngineRuntime:
     blocker: str = ""
     blocker_next_retry_at: str | None = None
     orderable_cash: float = 0.0
+    available_cash: float = 0.0
+    d2_cash: float = 0.0
+    orderable_cash_source: str = "unknown"
+    orderable_cash_stale: bool = True
+    orderable_cash_last_updated_at: str | None = None
+    snapshot_warning: str = ""
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
+    last_portfolio_refresh_epoch: float = 0.0
 
 
 class AutoTradingEngine:
@@ -46,6 +55,23 @@ class AutoTradingEngine:
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self._reload_config()
+        self._check_runtime_writable_paths()
+        self._restore_last_good_orderable(source="cached")
+
+
+    def _check_runtime_writable_paths(self) -> None:
+        targets = [Path("data"), Path("logs"), Path("strategy.yaml")]
+        for target in targets:
+            try:
+                parent = target if target.is_dir() else target.parent
+                parent.mkdir(parents=True, exist_ok=True)
+                writable = os.access(parent, os.W_OK)
+                if target.exists() and target.is_file():
+                    writable = writable and os.access(target, os.W_OK)
+                if not writable:
+                    logger.warning("event=PERMISSION_WARN path=%s writable=%s", target, writable)
+            except Exception as exc:
+                logger.warning("event=PERMISSION_WARN path=%s error=%s", target, exc)
 
     def _reload_config(self) -> None:
         self.base_config = self.cfg_mgr.load()
@@ -96,6 +122,49 @@ class AutoTradingEngine:
             return True, None
         return False, None
 
+    @staticmethod
+    def _money_to_float(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).replace(",", "").strip()
+        if not text:
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _compute_orderable_cash(self, account: dict[str, Any]) -> tuple[float, str]:
+        raw = account.get("raw_summary", {}) if isinstance(account.get("raw_summary"), dict) else {}
+        candidates: list[tuple[str, Any]] = [
+            ("ord_psbl_cash", account.get("ord_psbl_cash", raw.get("ord_psbl_cash"))),
+            ("available_cash", account.get("available_cash")),
+            ("raw_summary.dnca_tot_amt", raw.get("dnca_tot_amt")),
+            ("cash", account.get("cash")),
+        ]
+        for source, val in candidates:
+            num = self._money_to_float(val)
+            if num > 0:
+                return num, source
+        return 0.0, "none"
+
+    def _restore_last_good_orderable(self, source: str = "cached") -> None:
+        last_good = self.db.get_engine_state_float("last_good_orderable_cash", default=0.0)
+        if last_good > 0:
+            self.runtime.orderable_cash = last_good
+            self.runtime.available_cash = max(self.runtime.available_cash, last_good)
+            self.runtime.orderable_cash_source = source
+            self.runtime.orderable_cash_stale = True
+        self.runtime.orderable_cash_last_updated_at = self.db.get_engine_state("last_good_orderable_at")
+
+    def _save_last_good_orderable(self, value: float) -> None:
+        self.db.set_engine_state_float("last_good_orderable_cash", value)
+        ts = datetime.utcnow().isoformat()
+        self.db.set_engine_state("last_good_orderable_at", ts)
+        self.runtime.orderable_cash_last_updated_at = ts
+
     def heartbeat(self) -> dict[str, Any]:
         return {
             "enabled": self.get_auto_trading_enabled(),
@@ -104,6 +173,12 @@ class AutoTradingEngine:
             "next_retry_at": self.runtime.blocker_next_retry_at,
             "current_profile": self.runtime.current_profile,
             "orderable_cash": self.runtime.orderable_cash,
+            "available_cash": self.runtime.available_cash,
+            "d2_cash": self.runtime.d2_cash,
+            "orderable_cash_source": self.runtime.orderable_cash_source,
+            "orderable_cash_stale": self.runtime.orderable_cash_stale,
+            "orderable_cash_last_updated_at": self.runtime.orderable_cash_last_updated_at,
+            "snapshot_warning": self.runtime.snapshot_warning,
             "candidates_count": self.runtime.candidates_count,
             "recent_blockers": self.runtime.recent_blockers[-5:],
             "open_positions": len(self.runtime.open_positions),
@@ -153,16 +228,31 @@ class AutoTradingEngine:
             return
 
         try:
-            snap = self.get_portfolio_snapshot(force_refresh=False)
-            self.runtime.orderable_cash = float(snap.get("account", {}).get("available_cash", 0) or 0)
+            if self._is_live_mode():
+                self.refresh_portfolio_snapshot(force=False, trigger="tick")
+            snap = self.get_cached_portfolio_snapshot() or {}
+            account = snap.get("account", {}) if isinstance(snap, dict) else {}
+            live_orderable, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
+            self.runtime.available_cash = self._money_to_float(account.get("available_cash", live_orderable) if isinstance(account, dict) else live_orderable)
+            self.runtime.d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)) if isinstance(account, dict) else 0)
+            self.runtime.snapshot_warning = str((snap or {}).get("warning") or "")
+            if live_orderable > 0:
+                self.runtime.orderable_cash = live_orderable
+                self.runtime.orderable_cash_source = source
+                self.runtime.orderable_cash_stale = False
+                self._save_last_good_orderable(live_orderable)
+            else:
+                self._restore_last_good_orderable(source="cached")
             self._apply_profile_by_cash(self.runtime.orderable_cash)
             self._clear_blocker()
         except Exception as exc:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return
+            self._restore_last_good_orderable(source="cached")
             logger.warning("tick skip reason=PORTFOLIO_FETCH_FAIL detail=%s", self.format_exception(exc))
 
         status = get_market_status()
@@ -191,6 +281,7 @@ class AutoTradingEngine:
             is_temp, next_retry = self._is_temporary_kis_error(exc)
             if is_temp:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+                self._restore_last_good_orderable(source="cached")
                 logger.warning("tick skip reason=KIS_TOKEN_COOLDOWN next_retry_at=%s", next_retry)
                 return
             formatted = self.format_exception(exc)
@@ -269,25 +360,79 @@ class AutoTradingEngine:
         if max_buy > 0 and estimated_cost > max_buy:
             return False, "MAX_BUY_EXCEEDED", detail
         return True, "OK", detail
-    def get_buy_candidates_preview(self, top_n: int = 10) -> list[dict[str, Any]]:
+
+    def get_buy_candidates_preview(self, top_n: int = 10) -> dict[str, Any]:
+        """UI-safe preview. Never calls KIS quote/account APIs.
+
+        Data source priority:
+        1) cached candidates file(news client state)
+        2) recent DB signals fallback
+        """
         self._reload_config()
-        quotes, score_map = self._load_universe_quotes()
-        candidates = self.build_candidates(self._filter_small_cash_universe(quotes), external_score_map=score_map)
-        try:
-            account = self.get_portfolio_snapshot(force_refresh=False).get("account", {})
-            available_cash = float(account.get("available_cash", 0) or 0)
-        except Exception:
-            available_cash = 0.0
-        out: list[dict[str, Any]] = []
-        for c in candidates[:top_n]:
-            qty = self.determine_order_qty(c["price"], available_cash)
-            ok, reason, detail = self.check_affordability(c["price"], qty, available_cash)
-            out.append({"symbol": c["symbol"], "total_score": c["total_score"], "price_used": c["price"], "qty": qty, "estimated_cost": round(detail["estimated_cost"], 2), "affordable": c["strategy_pass"] and ok, "reason": reason if not ok else "OK"})
-        return out
+
+        token_status = self.kis.get_token_status()
+        news_state = self.news_client.load_state()
+        cooldown_reason = self.runtime.blocker or news_state.get("blocker") or ""
+        next_retry_at = self.runtime.blocker_next_retry_at or token_status.get("next_retry_at")
+
+        if token_status.get("cooldown_active") or cooldown_reason in {"KIS_TOKEN_COOLDOWN", "PER_MINUTE_CAP_EXCEEDED", "DAILY_CAP_EXCEEDED"}:
+            return {
+                "rows": [],
+                "reason": "KIS token cooldown active",
+                "next_retry_at": next_retry_at,
+                "last_updated_at": news_state.get("last_updated_at"),
+                "next_update_at": news_state.get("next_update_at"),
+            }
+
+        rows: list[dict[str, Any]] = []
+        cached_candidates = self.news_client.load_candidates()
+        if cached_candidates:
+            for c in cached_candidates[:top_n]:
+                rows.append(
+                    {
+                        "symbol": c.get("symbol", ""),
+                        "total_score": float(c.get("score", 0) or 0),
+                        "price_used": None,
+                        "qty": None,
+                        "estimated_cost": None,
+                        "affordable": None,
+                        "reason": "CACHED_CANDIDATE_ONLY",
+                    }
+                )
+        else:
+            try:
+                recent = self.db.fetch_df("SELECT symbol, total_score, reason FROM signals ORDER BY id DESC LIMIT 50")
+            except Exception:
+                recent = None
+            if recent is not None and not recent.empty:
+                dedup: dict[str, dict[str, Any]] = {}
+                for _, r in recent.iterrows():
+                    symbol = str(r.get("symbol", "") or "")
+                    if symbol and symbol not in dedup:
+                        dedup[symbol] = {
+                            "symbol": symbol,
+                            "total_score": float(r.get("total_score", 0) or 0),
+                            "price_used": None,
+                            "qty": None,
+                            "estimated_cost": None,
+                            "affordable": None,
+                            "reason": str(r.get("reason", "") or "CACHED_SIGNAL_ONLY"),
+                        }
+                    if len(dedup) >= top_n:
+                        break
+                rows = list(dedup.values())
+
+        return {
+            "rows": rows,
+            "reason": "OK" if rows else "NO_CACHED_CANDIDATES",
+            "next_retry_at": next_retry_at,
+            "last_updated_at": news_state.get("last_updated_at"),
+            "next_update_at": news_state.get("next_update_at"),
+        }
 
     def _attempt_buy_candidates(self, candidates: list[dict[str, Any]]) -> None:
         account = self.kis.fetch_account_summary()
-        available_cash = float(account.get("available_cash", 0) or 0)
+        available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
         if available_cash <= 0:
             logger.warning("event=BUY_SKIP reason=CASH_ZERO orderable_cash=0 candidates=%s", len(candidates))
             return
@@ -321,15 +466,87 @@ class AutoTradingEngine:
             return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": f"{err_type}: {message}", "error_detail": detail, "rows": rows}
         return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": None, "error_detail": {}, "rows": rows}
 
+    def get_cached_portfolio_snapshot(self) -> dict[str, Any] | None:
+        snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
+        return snap
+
+    def _is_live_mode(self) -> bool:
+        return str(self.config.get("mode", "DRY-RUN")).upper() == "LIVE"
+
+    def refresh_portfolio_snapshot(self, force: bool = False, trigger: str = "manual") -> dict[str, Any]:
+        self._reload_config()
+        now = time.time()
+        min_gap_sec = 60
+        if trigger == "tick":
+            min_gap_sec = int(self.config.get("portfolio_refresh_interval_sec", 300))
+        next_allowed = float(self.db.get_engine_state_float("portfolio_refresh_next_retry_epoch", default=0.0))
+        if not force and now < next_allowed:
+            next_retry_at = datetime.utcfromtimestamp(next_allowed).isoformat()
+            return {"ok": False, "reason": "PORTFOLIO_REFRESH_RATE_LIMIT", "next_retry_at": next_retry_at, "source": "CACHE", "snapshot": self.get_cached_portfolio_snapshot()}
+
+        self.db.set_engine_state_float("portfolio_refresh_next_retry_epoch", now + min_gap_sec)
+
+        if not self._is_live_mode() and trigger != "tick":
+            snap = self.get_cached_portfolio_snapshot() or self.get_portfolio_snapshot(force_refresh=False)
+            return {"ok": True, "reason": "DRY_RUN_CACHE", "source": "CACHE", "snapshot": snap}
+
+        try:
+            snap = self.get_portfolio_snapshot(force_refresh=True)
+            self.runtime.last_portfolio_refresh_epoch = now
+            self.db.set_engine_state("last_portfolio_refresh_at", datetime.utcnow().isoformat())
+            return {"ok": True, "reason": "LIVE_REFRESHED", "source": "LIVE", "snapshot": snap}
+        except Exception as exc:
+            is_temp, next_retry = self._is_temporary_kis_error(exc)
+            if is_temp:
+                self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
+            cached = self.get_cached_portfolio_snapshot()
+            return {"ok": False, "reason": self.format_exception(exc), "next_retry_at": next_retry, "source": "CACHE", "snapshot": cached}
+
     def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
         self._reload_config()
         snap, state = self.portfolio_service.get_snapshot(force_refresh=force_refresh)
         if snap:
             return snap
         account = self.kis.fetch_account_summary()
+        orderable_cash, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
+        available_cash = self._money_to_float(account.get("available_cash", orderable_cash))
+        if available_cash <= 0 and orderable_cash > 0:
+            available_cash = orderable_cash
+        d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)))
+        warning = ""
+        selected_keys = account.get("selected_keys", {}) if isinstance(account.get("selected_keys"), dict) else {}
+        if orderable_cash == 0 and d2_cash > 0:
+            warning = "ORDERABLE_CASH_MAPPING_SUSPECT"
+            logger.warning(
+                "event=ACCOUNT_MAPPING_WARN warning=%s orderable_cash=%s d2_cash=%s selected_keys=%s",
+                warning,
+                int(orderable_cash),
+                int(d2_cash),
+                selected_keys,
+            )
+
+        account["orderable_cash"] = orderable_cash
+        account["available_cash"] = available_cash
+        account["d2_cash"] = d2_cash
+
         positions = self.kis.fetch_positions()
         orders = self.kis.fetch_recent_orders(limit=20)
-        snap = {"account": account, "positions": positions, "orders": orders, "token_status": self.kis.get_token_status(), "throttle": state, "ts": datetime.utcnow().isoformat()}
+        snap = {
+            "account": account,
+            "orderable_cash": orderable_cash,
+            "available_cash": available_cash,
+            "d2_cash": d2_cash,
+            "snapshot_source": "account_summary_v2",
+            "warning": warning,
+            "orderable_cash_source": source if orderable_cash > 0 else "unknown",
+            "orderable_cash_stale": False,
+            "orderable_cash_last_updated_at": self.db.get_engine_state("last_good_orderable_at"),
+            "positions": positions,
+            "orders": orders,
+            "token_status": self.kis.get_token_status(),
+            "throttle": state,
+            "ts": datetime.utcnow().isoformat(),
+        }
         self.portfolio_service.set_cached(snap)
         return snap
 
@@ -344,7 +561,7 @@ class AutoTradingEngine:
     def precheck_manual_buy(self, price: float, qty: int) -> dict[str, Any]:
         self._reload_config()
         account = self.kis.fetch_account_summary()
-        available_cash = float(account.get("available_cash", 0) or 0)
+        available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
         ok, reason, detail = self.check_affordability(price, qty, available_cash)
         return {"ok": ok, "reason": reason, **detail}
 

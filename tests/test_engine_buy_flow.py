@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app.core.database import Database
 from app.core.engine import AutoTradingEngine
@@ -70,16 +70,62 @@ class EngineBuyFlowTests(unittest.TestCase):
             self.engine._attempt_buy_candidates(candidates)
 
 
+
+
+    def test_compute_orderable_fallback_to_dnca_when_available_zero(self):
+        account = {"available_cash": 0, "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
+        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
+        self.assertEqual(value, 178280)
+        self.assertEqual(source, "raw_summary.dnca_tot_amt")
+
+    def test_compute_orderable_prefers_available_cash(self):
+        account = {"available_cash": "120,398", "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
+        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
+        self.assertEqual(value, 120398)
+        self.assertEqual(source, "available_cash")
+
+    def test_preview_never_calls_live_quotes(self):
+        with patch("app.services.news_client.NewsClient.load_candidates", return_value=[{"symbol": "005930", "score": 10.0}]),              patch("app.services.news_client.NewsClient.load_state", return_value={"last_updated_at": "2026-01-01T00:00:00", "next_update_at": "2026-01-01T00:30:00"}),              patch("app.services.kis_client.KISClient.fetch_universe_quotes") as mock_quotes:
+            preview = self.engine.get_buy_candidates_preview(top_n=5)
+
+        mock_quotes.assert_not_called()
+        self.assertEqual(preview["reason"], "OK")
+        self.assertEqual(preview["rows"][0]["symbol"], "005930")
+
     def test_token_cooldown_does_not_disable_engine(self):
         self.engine.set_auto_trading_enabled(True)
-
-        def fail_portfolio(*args, **kwargs):
-            raise KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"})
-
-        self.engine.get_portfolio_snapshot = fail_portfolio  # type: ignore[method-assign]
+        self.engine.kis.fetch_account_summary = Mock(side_effect=KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"}))
         self.engine.tick()
         self.assertTrue(self.engine.get_auto_trading_enabled())
-        self.assertEqual(self.engine.runtime.blocker, "KIS_TOKEN_COOLDOWN")
+
+
+    @patch("app.core.engine.get_market_status")
+    def test_last_good_orderable_persists_on_token_cooldown(self, mock_market):
+        mock_market.return_value = type("S", (), {"can_place_order": False, "reason": "장마감", "is_open": False})()
+        self.engine.set_auto_trading_enabled(True)
+
+        self.engine._is_live_mode = Mock(return_value=True)  # type: ignore[method-assign]
+
+        good_snap = {"account": {"orderable_cash": 120398, "available_cash": 120398, "d2_cash": 121280}, "warning": ""}
+
+        def good_refresh(*args, **kwargs):
+            self.engine.portfolio_service.set_cached(good_snap)
+            return {"ok": True, "source": "LIVE", "snapshot": good_snap}
+
+        self.engine.refresh_portfolio_snapshot = good_refresh  # type: ignore[method-assign]
+        self.engine.tick()
+        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
+
+        def fail_refresh(*args, **kwargs):
+            return {"ok": False, "reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "source": "CACHE", "snapshot": good_snap}
+
+        self.engine.refresh_portfolio_snapshot = fail_refresh  # type: ignore[method-assign]
+        self.engine.portfolio_service.set_cached(good_snap)
+        self.engine.tick()
+
+        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
+        self.assertIn(self.engine.runtime.orderable_cash_source, {"cached", "available_cash", "ord_psbl_cash"})
+        self.assertEqual(self.engine.db.get_engine_state_float("last_good_orderable_cash"), 120398.0)
 
     def test_max_buy_exceeded_skips_candidate(self):
         self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})

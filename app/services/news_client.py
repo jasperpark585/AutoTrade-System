@@ -8,7 +8,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover
+    requests = None
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -135,6 +138,8 @@ class NewsClient:
         if not key:
             return self._fetch_dummy_candidates()
         try:
+            if requests is None:
+                return self._fetch_dummy_candidates()
             # Placeholder endpoint style for abstraction; replace with provider-specific endpoint.
             resp = requests.get("https://newsapi.org/v2/top-headlines", params={"category": "business", "apiKey": key, "language": "ko"}, timeout=8)
             if resp.status_code != 200:
