@@ -66,6 +66,37 @@ class GPTScoutTests(unittest.TestCase):
             guard = payload.get("openai_guard", {})
             self.assertTrue(bool(guard.get("require_paid_opt_in")))
 
+    def test_affordable_price_cap_filters_expensive_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            scout = GPTScout(
+                snapshot_path=str(Path(td) / "gpt_candidates.json"),
+                guard_state_path=str(Path(td) / "openai_guard_state.json"),
+            )
+            mocked_candidates = [
+                {
+                    "symbol": "005930",
+                    "name": "A",
+                    "price_krw": 120000,
+                    "momentum_score": 80,
+                    "pre_breakout_score": 80,
+                    "overheat_score": 30,
+                },
+                {
+                    "symbol": "003490",
+                    "name": "B",
+                    "price_krw": 42000,
+                    "momentum_score": 72,
+                    "pre_breakout_score": 76,
+                    "overheat_score": 28,
+                },
+            ]
+            cfg = {"max_candidates": 5, "api_key": "dummy", "affordable_price_cap_krw": 50000}
+            with patch.object(scout, "_request_openai_candidates", return_value=(mocked_candidates, "OPENAI_OK")):
+                payload = scout.refresh_daily_candidates(cfg=cfg, fallback_symbols=["005930", "000660", "035420"])
+            self.assertEqual(payload["source"], "OPENAI_OK")
+            self.assertEqual(payload["symbols"], ["003490"])
+            self.assertEqual(payload["rank_config"]["affordable_price_cap_krw"], 50000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

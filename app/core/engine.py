@@ -344,6 +344,10 @@ class AutoTradingEngine:
             }
 
         openai_cfg = dict(scout_cfg)
+        buy_budget = self._candidate_buy_budget_krw()
+        if buy_budget > 0:
+            # Guide GPT to return symbols that can be bought with current account budget.
+            openai_cfg["affordable_price_cap_krw"] = round(float(buy_budget), 2)
         allow_external_call = bool(scout_cfg.get("allow_external_call", False))
         if allow_external_call:
             openai_cfg["api_key"] = str(openai_cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "")).strip()
@@ -566,10 +570,27 @@ class AutoTradingEngine:
         symbols = self._resolve_watchlist_symbols()
         return self.kis.fetch_universe_quotes(symbols=symbols)
 
+    def _candidate_buy_budget_krw(self) -> float:
+        orderable = float(self.runtime.orderable_cash or 0.0)
+        available = float(self.runtime.available_cash or 0.0)
+        cash_budget = orderable if orderable > 0 else available
+        if cash_budget <= 0:
+            return 0.0
+
+        max_buy = self._max_buy_per_trade()
+        if max_buy > 0:
+            return max(0.0, min(cash_budget, max_buy))
+        return max(0.0, cash_budget)
+
     def _filter_small_cash_universe(self, quotes: list[Quote]) -> list[Quote]:
-        if self.runtime.current_profile != "small_cash":
-            return quotes
-        return [q for q in quotes if q.price <= 80000 and q.price <= self.runtime.orderable_cash]
+        budget_cap = self._candidate_buy_budget_krw()
+        if self.runtime.current_profile == "small_cash":
+            # Keep low-price bias for small account profile.
+            budget_cap = min(80000.0, budget_cap) if budget_cap > 0 else 80000.0
+
+        if budget_cap <= 0:
+            return [] if self.runtime.current_profile == "small_cash" else quotes
+        return [q for q in quotes if q.price <= budget_cap]
 
     @staticmethod
     def format_exception(exc: Exception) -> str:

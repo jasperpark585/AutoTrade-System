@@ -73,6 +73,7 @@ class ScoutRankConfig:
     price_cap_krw: float = 120000.0
     prefer_price_krw: float = 40000.0
     overheat_score_limit: float = 75.0
+    affordable_price_cap_krw: float = 0.0
 
 
 class GPTScout:
@@ -164,6 +165,8 @@ class GPTScout:
             seen.add(symbol)
 
             price = _to_float(row.get("price_krw"), default=0.0)
+            if rank_cfg.affordable_price_cap_krw > 0 and price > 0 and price > rank_cfg.affordable_price_cap_krw:
+                continue
             momentum = _to_float(row.get("momentum_score"), default=50.0)
             pre_breakout = _to_float(row.get("pre_breakout_score"), default=50.0)
             overheat = _to_float(row.get("overheat_score"), default=50.0)
@@ -352,12 +355,19 @@ class GPTScout:
         model = str(cfg.get("model") or "gpt-4.1-mini").strip()
         max_candidates = max(3, int(cfg.get("max_candidates", 8)))
         max_output_tokens = max(300, _to_int(cfg.get("max_output_tokens"), 900))
+        affordable_cap = max(0.0, _to_float(cfg.get("affordable_price_cap_krw"), default=0.0))
         user_context = str(cfg.get("user_context") or "").strip()
         now_kst = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
         fallback_text = ",".join(fallback_symbols) if fallback_symbols else "-"
+        affordability_text = (
+            f"Strictly exclude symbols priced above {int(affordable_cap)} KRW because account budget cannot buy them now. "
+            if affordable_cap > 0
+            else ""
+        )
         prompt = (
             "Select Korean stock symbols that are likely to surge soon but are not already overheated. "
             "Prioritize lower-priced names over expensive extended names. "
+            f"{affordability_text}"
             "Output strict JSON with this schema: "
             "{\"candidates\":[{\"symbol\":\"6-digit\",\"name\":\"name\",\"thesis\":\"one line\","
             "\"risk_note\":\"risk\","
@@ -445,6 +455,7 @@ class GPTScout:
             price_cap_krw=max(1.0, _to_float(cfg.get("price_cap_krw"), default=120000.0)),
             prefer_price_krw=max(1.0, _to_float(cfg.get("prefer_price_krw"), default=40000.0)),
             overheat_score_limit=min(100.0, max(1.0, _to_float(cfg.get("overheat_score_limit"), default=75.0))),
+            affordable_price_cap_krw=max(0.0, _to_float(cfg.get("affordable_price_cap_krw"), default=0.0)),
         )
 
         candidates, source = self._request_openai_candidates(cfg, fallback_symbols)
@@ -453,6 +464,12 @@ class GPTScout:
             source = f"FALLBACK:{source}"
 
         ranked = self._rank_candidates(candidates, rank_cfg=rank_cfg)
+        if not ranked:
+            ranked = self._rank_candidates(
+                self._fallback_candidates(fallback_symbols, max_candidates=max_candidates),
+                rank_cfg=rank_cfg,
+            )
+            source = "FALLBACK:AFFORDABLE_FILTER_EMPTY"
         now_kst = datetime.now(KST)
         payload = {
             "date_kst": now_kst.date().isoformat(),
@@ -466,6 +483,7 @@ class GPTScout:
                 "price_cap_krw": rank_cfg.price_cap_krw,
                 "prefer_price_krw": rank_cfg.prefer_price_krw,
                 "overheat_score_limit": rank_cfg.overheat_score_limit,
+                "affordable_price_cap_krw": rank_cfg.affordable_price_cap_krw,
             },
             "openai_guard": self.get_guard_status(cfg),
         }

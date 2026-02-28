@@ -91,6 +91,18 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["symbol"], "005930")
 
+    def test_small_cash_universe_filters_by_affordable_budget(self):
+        self.engine.runtime.current_profile = "small_cash"
+        self.engine.runtime.orderable_cash = 120000
+        self.engine.runtime.available_cash = 120000
+        self.engine.config["risk_limits"]["max_buy_amount_per_trade"] = 50000
+        quotes = [
+            Quote("111111", 60000, 3.0, 2.3, 120.0, 0.2, 0.4),
+            Quote("222222", 45000, 3.0, 2.3, 120.0, 0.2, 0.4),
+        ]
+        filtered = self.engine._filter_small_cash_universe(quotes)
+        self.assertEqual([q.symbol for q in filtered], ["222222"])
+
 
 if __name__ == "__main__":
     unittest.main()
