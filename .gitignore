@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+logs/*.log
+data/*.db
+data/*.json
+data/*.enc
+!data/.gitkeep
+
+*.local_backup

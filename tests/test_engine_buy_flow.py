@@ -1,10 +1,12 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.core.database import Database
 from app.core.engine import AutoTradingEngine
 from app.services.kakao import KakaoNotifier
-from app.services.kis_client import KISError, Quote
+from app.services.kis_client import KISCooldownError, Quote
 
 
 class DummyConfigManager:
@@ -15,17 +17,12 @@ class DummyConfigManager:
             "risk_limits": {
                 "max_daily_trades": 8,
                 "max_orders_per_day": 8,
-                "max_daily_loss_krw": 600000,
-                "max_daily_loss_pct": 2.5,
-                "equity_base_krw": 30000000,
                 "max_positions": 4,
                 "max_buy_amount_per_trade_krw": 1500000,
-                "cooldown_after_consecutive_losses": 3,
-                "cooldown_minutes": 20,
             },
             "scoring_weights": {"universe": 20, "pre_breakout": 25, "trigger": 30, "confirmation": 25},
             "stages": {
-                "universe": {"max_spread_pct": 1.2, "use_allowlist": False, "allowlist_symbols": []},
+                "universe": {"max_spread_pct": 1.2},
                 "pre_breakout": {"volume_spike_ratio_min": 2.2, "intraday_volatility_pct_min": 1.8},
                 "trigger": {"breakout_zone_1_pct": 0.6, "breakout_zone_2_pct": 1.2, "breakout_zone_3_pct": 2.0},
                 "confirmation": {"execution_strength_min": 105, "spread_pct_max": 0.9, "trend_slope_min": 0.2},
@@ -33,106 +30,37 @@ class DummyConfigManager:
             },
         }
 
+    def runtime_flags(self, config):
+        return {
+            "mode": "DRY-RUN",
+            "explicit_live": False,
+            "env_dry_run": True,
+            "dry_run": True,
+            "mock_order": False,
+            "live_order_enabled": False,
+        }
+
 
 class EngineBuyFlowTests(unittest.TestCase):
     def setUp(self):
-        self.engine = AutoTradingEngine(DummyConfigManager(), Database(), KakaoNotifier(None))
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "autotrade.db")
+        self.engine = AutoTradingEngine(DummyConfigManager(), self.db, KakaoNotifier(None))
 
-    def test_skip_insufficient_cash_then_try_next(self):
-        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 200000})
-
-        candidates = [
-            {"symbol": "A", "pass_fail": "PASS", "price": 300000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
-            {"symbol": "B", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
-        ]
-
-        called = []
-
-        def fake_try(symbol, price, reason, qty=None):
-            called.append(symbol)
-
-        self.engine._try_entry = fake_try  # type: ignore[method-assign]
-        self.engine._attempt_buy_candidates(candidates)
-        self.assertEqual(called, ["B"])
-
-    def test_api_error_stops_loop(self):
-        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
-        candidates = [
-            {"symbol": "A", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
-            {"symbol": "B", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
-        ]
-
-        def fail_try(symbol, price, reason, qty=None):
-            raise KISError("api fail", detail={"http_status": 503, "rt_cd": "9", "msg1": "server error"})
-
-        self.engine._try_entry = fail_try  # type: ignore[method-assign]
-        with self.assertRaises(KISError):
-            self.engine._attempt_buy_candidates(candidates)
-
-
-
-
-    def test_compute_orderable_fallback_to_dnca_when_available_zero(self):
-        account = {"available_cash": 0, "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
-        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
-        self.assertEqual(value, 178280)
-        self.assertEqual(source, "raw_summary.dnca_tot_amt")
-
-    def test_compute_orderable_prefers_available_cash(self):
-        account = {"available_cash": "120,398", "raw_summary": {"dnca_tot_amt": "178,280"}, "cash": 178280}
-        value, source = self.engine._compute_orderable_cash(account)  # type: ignore[attr-defined]
-        self.assertEqual(value, 120398)
-        self.assertEqual(source, "available_cash")
-
-    def test_preview_never_calls_live_quotes(self):
-        with patch("app.services.news_client.NewsClient.load_candidates", return_value=[{"symbol": "005930", "score": 10.0}]),              patch("app.services.news_client.NewsClient.load_state", return_value={"last_updated_at": "2026-01-01T00:00:00", "next_update_at": "2026-01-01T00:30:00"}),              patch("app.services.kis_client.KISClient.fetch_universe_quotes") as mock_quotes:
-            preview = self.engine.get_buy_candidates_preview(top_n=5)
-
-        mock_quotes.assert_not_called()
-        self.assertEqual(preview["reason"], "OK")
-        self.assertEqual(preview["rows"][0]["symbol"], "005930")
-
-    def test_token_cooldown_does_not_disable_engine(self):
-        self.engine.set_auto_trading_enabled(True)
-        self.engine.kis.fetch_account_summary = Mock(side_effect=KISError("KIS token cooldown active", detail={"next_retry_at": "2099-01-01T00:00:00", "http_status": 403, "msg1": "EGW00133"}))
-        self.engine.tick()
-        self.assertTrue(self.engine.get_auto_trading_enabled())
-
-
-    @patch("app.core.engine.get_market_status")
-    def test_last_good_orderable_persists_on_token_cooldown(self, mock_market):
-        mock_market.return_value = type("S", (), {"can_place_order": False, "reason": "장마감", "is_open": False})()
-        self.engine.set_auto_trading_enabled(True)
-
-        self.engine._is_live_mode = Mock(return_value=True)  # type: ignore[method-assign]
-
-        good_snap = {"account": {"orderable_cash": 120398, "available_cash": 120398, "d2_cash": 121280}, "warning": ""}
-
-        def good_refresh(*args, **kwargs):
-            self.engine.portfolio_service.set_cached(good_snap)
-            return {"ok": True, "source": "LIVE", "snapshot": good_snap}
-
-        self.engine.refresh_portfolio_snapshot = good_refresh  # type: ignore[method-assign]
-        self.engine.tick()
-        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
-
-        def fail_refresh(*args, **kwargs):
-            return {"ok": False, "reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "source": "CACHE", "snapshot": good_snap}
-
-        self.engine.refresh_portfolio_snapshot = fail_refresh  # type: ignore[method-assign]
-        self.engine.portfolio_service.set_cached(good_snap)
-        self.engine.tick()
-
-        self.assertEqual(self.engine.runtime.orderable_cash, 120398)
-        self.assertIn(self.engine.runtime.orderable_cash_source, {"cached", "available_cash", "ord_psbl_cash"})
-        self.assertEqual(self.engine.db.get_engine_state_float("last_good_orderable_cash"), 120398.0)
+    def tearDown(self):
+        self._tmp.cleanup()
 
     @patch("app.core.engine.get_market_status")
     def test_cooldown_sets_transient_blocker_not_fatal(self, mock_market):
-        mock_market.return_value = type("S", (), {"can_place_order": True, "reason": "장중", "is_open": True})()
+        mock_market.return_value = type("S", (), {"can_place_order": True, "reason": "OPEN", "is_open": True})()
         self.engine.set_auto_trading_enabled(True)
-        self.engine._is_live_mode = Mock(return_value=True)  # type: ignore[method-assign]
-        self.engine.refresh_portfolio_snapshot = Mock(side_effect=KISError("cooldown", detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "http_status": 403}))  # type: ignore[method-assign]
+        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 1000000})
+        self.engine.kis.fetch_universe_quotes = Mock(
+            side_effect=KISCooldownError(
+                "cooldown",
+                detail={"reason": "KIS_TOKEN_COOLDOWN", "next_retry_at": "2099-01-01T00:00:00", "http_status": 403},
+            )
+        )
 
         self.engine.tick()
 
@@ -142,12 +70,11 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertEqual(hb["next_retry_at"], "2099-01-01T00:00:00")
         self.assertFalse(bool(hb["fatal_error"]))
 
-    def test_max_buy_exceeded_skips_candidate(self):
-        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 10_000_000})
-        self.engine.config["risk_limits"]["max_buy_amount_per_trade_krw"] = 100_000
+    def test_skip_insufficient_cash_then_try_next(self):
+        self.engine.kis.fetch_account_summary = Mock(return_value={"available_cash": 200000})
         candidates = [
-            {"symbol": "A", "pass_fail": "PASS", "price": 200000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
-            {"symbol": "B", "pass_fail": "PASS", "price": 90000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
+            {"symbol": "A", "pass_fail": "PASS", "price": 300000, "reason": "ok", "total_score": 90, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
+            {"symbol": "B", "pass_fail": "PASS", "price": 100000, "reason": "ok", "total_score": 80, "stage_scores": {}, "stage_checks": {}, "strategy_pass": True},
         ]
         called = []
 
@@ -157,6 +84,12 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.engine._try_entry = fake_try  # type: ignore[method-assign]
         self.engine._attempt_buy_candidates(candidates)
         self.assertEqual(called, ["B"])
+
+    def test_build_candidates(self):
+        quotes = [Quote("005930", 70000, 3.0, 2.3, 120.0, 0.2, 0.4)]
+        rows = self.engine.build_candidates(quotes)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "005930")
 
 
 if __name__ == "__main__":

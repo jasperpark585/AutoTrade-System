@@ -1,4 +1,5 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -7,7 +8,9 @@ def setup_logging(log_file: str = "logs/autotrade.log") -> None:
     formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root.setLevel(level)
     root.handlers.clear()
 
     stream_handler = logging.StreamHandler()

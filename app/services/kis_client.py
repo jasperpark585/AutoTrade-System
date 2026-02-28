@@ -101,6 +101,8 @@ class KISClient:
         self.appsecret = os.getenv("KIS_APPSECRET", "")
         self.account_no = os.getenv("KIS_ACCOUNT_NO", "")
         self.mock_live_order = os.getenv("KIS_MOCK_ORDER", "false").lower() == "true"
+        self.explicit_live = os.getenv("LIVE", "false").lower() in {"1", "true", "yes", "on"}
+        self.force_dry_run = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes", "on"}
 
         self.trend_window = int(os.getenv("KIS_TREND_WINDOW", "20"))
         self.volume_avg_days = int(os.getenv("KIS_VOLUME_AVG_DAYS", "20"))
@@ -109,6 +111,12 @@ class KISClient:
         self._token_expire_at: datetime | None = None
         self._token_retry_after_epoch: float = 0.0
         self._token_lock = threading.Lock()
+
+    def update_runtime_flags(self, dry_run: bool, mock_live_order: bool, explicit_live: bool, force_dry_run: bool) -> None:
+        self.dry_run = dry_run
+        self.mock_live_order = mock_live_order
+        self.explicit_live = explicit_live
+        self.force_dry_run = force_dry_run
 
     @retry(
         retry=retry_if_exception_type(KISError),
@@ -217,6 +225,10 @@ class KISClient:
             logger.info("DRY-RUN order simulated: %s %s x%s @ %s", side, symbol, qty, price)
             return {"status": "SIMULATED", "symbol": symbol, "qty": qty, "side": side, "price": price}
 
+        if not self.explicit_live or self.force_dry_run:
+            logger.warning("LIVE order blocked - explicit LIVE=true and DRY_RUN=false required")
+            return {"status": "BLOCKED", "reason": "LIVE_FLAG_REQUIRED", "symbol": symbol, "qty": qty, "side": side}
+
         market = get_market_status()
         if not market.can_place_order:
             msg = f"LIVE order blocked - market closed: {market.reason}"
@@ -293,6 +305,11 @@ class KISClient:
         return result
 
     def _validate_live_env(self) -> None:
+        if not self.explicit_live or self.force_dry_run:
+            raise KISError(
+                "LIVE mode is blocked. Set LIVE=true and DRY_RUN=false to allow real account calls.",
+                detail={"required_env": {"LIVE": "true", "DRY_RUN": "false"}},
+            )
         missing = [k for k, v in {
             "KIS_APPKEY": self.appkey,
             "KIS_APPSECRET": self.appsecret,

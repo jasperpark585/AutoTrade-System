@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 from app.core.config import ConfigManager
 from app.core.database import Database
@@ -19,52 +20,80 @@ logger = logging.getLogger(__name__)
 class HealthHandler(BaseHTTPRequestHandler):
     engine: AutoTradingEngine | None = None
 
-    def do_GET(self):  # noqa: N802
-        if self.path not in {"/health", "/status"}:
-            self.send_response(404)
-            self.end_headers()
-            return
-        payload = {"ok": True, "engine": self.engine.heartbeat() if self.engine else {}}
+    def _write_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def do_POST(self):  # noqa: N802
-        if self.path not in {"/refresh/portfolio", "/portfolio/refresh"}:
-            self.send_response(404)
-            self.end_headers()
-            return
-        if not self.engine:
-            self.send_response(503)
-            self.end_headers()
-            return
-        result = self.engine.refresh_portfolio_snapshot(force=True, trigger="manual")
-        body = json.dumps({"ok": bool(result.get("ok")), "result": result}).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json_body(self) -> dict[str, Any]:
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = max(0, int(raw_length))
+        except ValueError:
+            return {}
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def do_GET(self):  # noqa: N802
+        if self.path not in {"/health", "/status"}:
+            self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})
+            return
+        payload = {"ok": True, "engine": self.engine.heartbeat() if self.engine else {}}
+        self._write_json(200, payload)
+
+    def do_POST(self):  # noqa: N802
+        if not self.engine:
+            self._write_json(503, {"ok": False, "reason": "ENGINE_UNAVAILABLE"})
+            return
+
+        if self.path in {"/refresh/portfolio", "/portfolio/refresh"}:
+            result = self.engine.refresh_portfolio_snapshot(force=True, trigger="manual")
+            self._write_json(200, {"ok": bool(result.get("ok")), "result": result})
+            return
+
+        if self.path == "/report/clear":
+            payload = self._read_json_body()
+            only_dry = bool(payload.get("only_dry", True))
+            vacuum = bool(payload.get("vacuum", False))
+            result = self.engine.clear_report_data(only_dry=only_dry, vacuum=vacuum)
+            self._write_json(200, {"ok": True, "result": result})
+            return
+
+        if self.path == "/engine/enable":
+            payload = self._read_json_body()
+            enabled = bool(payload.get("enabled", False))
+            self.engine.set_auto_trading_enabled(enabled)
+            self._write_json(200, {"ok": True, "enabled": enabled})
+            return
+
+        self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})
 
 
 def run() -> None:
     setup_logging()
     cfg_mgr = ConfigManager()
     db = Database()
-
     notifier = KakaoNotifier(token=os.getenv("KAKAO_TOKEN"))
     engine = AutoTradingEngine(cfg_mgr, db, notifier)
-    # default is OFF; keep persisted operator selection across restarts
+
     if db.get_engine_state("auto_trading_enabled") is None:
         engine.set_auto_trading_enabled(False)
 
     HealthHandler.engine = engine
     server = HTTPServer(("0.0.0.0", 8000), HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info("Health server running on :8000/health and :8000/status")
+    logger.info("Engine API server on :8000 (/health, /status)")
 
     while True:
         cfg = cfg_mgr.load()

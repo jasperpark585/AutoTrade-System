@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,10 +12,10 @@ from typing import Any
 from app.core.config import ConfigManager
 from app.core.database import Database
 from app.core.market_hours import get_market_status
+from app.core.risk import RiskGuard
 from app.core.strategy import ScoreResult, StageStrategy
 from app.services.kakao import KakaoNotifier
 from app.services.kis_client import KISClient, KISCooldownError, KISError, Quote
-from app.services.news_client import NewsClient
 from app.services.portfolio_service import PortfolioService
 from app.utils.errors import unwrap_exception
 
@@ -26,7 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EngineRuntime:
     enabled: bool = False
-    open_positions: dict[str, dict] = field(default_factory=dict)
+    open_positions: dict[str, dict[str, Any]] = field(default_factory=dict)
     daily_trades: int = 0
     daily_loss_krw: float = 0.0
     fatal_error: str | None = None
@@ -49,15 +48,22 @@ class AutoTradingEngine:
     def __init__(self, config_manager: ConfigManager, db: Database, notifier: KakaoNotifier):
         self.cfg_mgr = config_manager
         self.db = db
-        self.runtime = EngineRuntime()
         self.notifier = notifier
+        self.runtime = EngineRuntime()
         self.portfolio_service = PortfolioService()
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
+        self.runtime_flags: dict[str, Any] = {
+            "mode": "DRY-RUN",
+            "explicit_live": False,
+            "env_dry_run": True,
+            "dry_run": True,
+            "mock_order": False,
+            "live_order_enabled": False,
+        }
         self._reload_config()
         self._check_runtime_writable_paths()
         self._restore_last_good_orderable(source="cached")
-
 
     def _check_runtime_writable_paths(self) -> None:
         targets = [Path("data"), Path("logs"), Path("strategy.yaml")]
@@ -65,20 +71,39 @@ class AutoTradingEngine:
             try:
                 parent = target if target.is_dir() else target.parent
                 parent.mkdir(parents=True, exist_ok=True)
-                writable = os.access(parent, os.W_OK)
-                if target.exists() and target.is_file():
-                    writable = writable and os.access(target, os.W_OK)
-                if not writable:
-                    logger.warning("event=PERMISSION_WARN path=%s writable=%s", target, writable)
             except Exception as exc:
                 logger.warning("event=PERMISSION_WARN path=%s error=%s", target, exc)
+
+    def _default_runtime_flags(self, config: dict[str, Any]) -> dict[str, Any]:
+        mode = str(config.get("mode", "DRY-RUN")).upper()
+        return {
+            "mode": mode,
+            "explicit_live": False,
+            "env_dry_run": mode != "LIVE",
+            "dry_run": mode != "LIVE",
+            "mock_order": False,
+            "live_order_enabled": False,
+        }
 
     def _reload_config(self) -> None:
         self.base_config = self.cfg_mgr.load()
         self.config = copy.deepcopy(self.base_config)
-        self.kis = KISClient(dry_run=self.config.get("mode", "DRY-RUN") == "DRY-RUN")
-        self.news_client = NewsClient(self.config)
+        if hasattr(self.cfg_mgr, "runtime_flags"):
+            flags = self.cfg_mgr.runtime_flags(self.config)
+        else:
+            flags = self._default_runtime_flags(self.config)
+        self.runtime_flags = flags
+
+        if not hasattr(self, "kis"):
+            self.kis = KISClient(dry_run=bool(flags.get("dry_run", True)))
+        self.kis.update_runtime_flags(
+            dry_run=bool(flags.get("dry_run", True)),
+            mock_live_order=bool(flags.get("mock_order", False)),
+            explicit_live=bool(flags.get("explicit_live", False)),
+            force_dry_run=bool(flags.get("env_dry_run", True)),
+        )
         self.strategy = StageStrategy(self.config)
+        self.risk = RiskGuard(self.config)
 
     def _sync_enabled_from_db(self) -> None:
         val = self.db.get_engine_state("auto_trading_enabled")
@@ -99,7 +124,12 @@ class AutoTradingEngine:
     def _record_blocker(self, reason: str, next_retry_at: str | None = None) -> None:
         self.runtime.blocker = reason
         self.runtime.blocker_next_retry_at = next_retry_at
-        event = {"event": "BLOCKER", "reason": reason, "next_retry_at": next_retry_at, "ts": datetime.utcnow().isoformat()}
+        event = {
+            "event": "BLOCKER",
+            "reason": reason,
+            "next_retry_at": next_retry_at,
+            "ts": datetime.utcnow().isoformat(),
+        }
         self.runtime.recent_blockers.append(event)
         self.runtime.recent_blockers = self.runtime.recent_blockers[-30:]
 
@@ -112,28 +142,29 @@ class AutoTradingEngine:
         if not value:
             return None
         try:
-            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except ValueError:
             return None
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
-    def _is_temporary_kis_error(self, exc: Exception) -> tuple[bool, str | None]:
+    def _is_cooldown_error(self, exc: Exception) -> tuple[bool, str | None]:
         if isinstance(exc, KISCooldownError):
             detail = exc.detail or {}
             return True, str(detail.get("next_retry_at") or "") or None
         if not isinstance(exc, KISError):
             return False, None
         detail = exc.detail or {}
-        msg = f"{str(exc)} {detail.get('msg1', '')}".lower()
-        next_retry = detail.get("next_retry_at")
-        if next_retry:
-            return True, str(next_retry)
-        if detail.get("http_status") == 403:
+        reason = str(detail.get("reason", "")).upper()
+        if reason == "KIS_TOKEN_COOLDOWN":
+            return True, str(detail.get("next_retry_at") or "") or None
+        if detail.get("next_retry_at"):
+            return True, str(detail.get("next_retry_at"))
+        if int(detail.get("http_status", 0) or 0) == 403:
             return True, None
-        temp_markers = ["egw00133", "temporarily unavailable", "잠시 후", "cooldown", "token"]
-        if any(m in msg for m in temp_markers):
+        lowered = f"{str(exc)} {detail.get('msg1', '')}".lower()
+        if any(token in lowered for token in ("cooldown", "temporarily unavailable", "egw00133")):
             return True, None
         return False, None
 
@@ -159,10 +190,10 @@ class AutoTradingEngine:
             ("raw_summary.dnca_tot_amt", raw.get("dnca_tot_amt")),
             ("cash", account.get("cash")),
         ]
-        for source, val in candidates:
-            num = self._money_to_float(val)
-            if num > 0:
-                return num, source
+        for source, value in candidates:
+            amount = self._money_to_float(value)
+            if amount > 0:
+                return amount, source
         return 0.0, "none"
 
     def _restore_last_good_orderable(self, source: str = "cached") -> None:
@@ -176,22 +207,12 @@ class AutoTradingEngine:
 
     def _save_last_good_orderable(self, value: float) -> None:
         self.db.set_engine_state_float("last_good_orderable_cash", value)
-        ts = datetime.utcnow().isoformat()
-        self.db.set_engine_state("last_good_orderable_at", ts)
-        self.runtime.orderable_cash_last_updated_at = ts
+        now_iso = datetime.utcnow().isoformat()
+        self.db.set_engine_state("last_good_orderable_at", now_iso)
+        self.runtime.orderable_cash_last_updated_at = now_iso
 
     def get_runtime_mode_flags(self) -> dict[str, Any]:
-        mode = str(self.config.get("mode", "DRY-RUN")).upper()
-        env_dry = str(os.getenv("DRY_RUN", "false")).lower() in {"1", "true", "yes", "on"}
-        kis_dry = bool(getattr(self.kis, "dry_run", mode != "LIVE"))
-        mock_order = bool(getattr(self.kis, "mock_live_order", False))
-        live_order_enabled = mode == "LIVE" and (not env_dry) and (not kis_dry) and (not mock_order)
-        return {
-            "mode": mode,
-            "dry_run": bool(env_dry or kis_dry),
-            "mock_order": mock_order,
-            "live_order_enabled": live_order_enabled,
-        }
+        return dict(self.runtime_flags)
 
     def heartbeat(self) -> dict[str, Any]:
         flags = self.get_runtime_mode_flags()
@@ -222,54 +243,73 @@ class AutoTradingEngine:
 
     def _deep_merge(self, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
         out = copy.deepcopy(base)
-        for k, v in override.items():
-            if isinstance(v, dict) and isinstance(out.get(k), dict):
-                out[k] = self._deep_merge(out[k], v)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = self._deep_merge(out[key], value)
             else:
-                out[k] = copy.deepcopy(v)
+                out[key] = copy.deepcopy(value)
         return out
 
     def _apply_profile_by_cash(self, orderable_cash_krw: float) -> None:
         cfg = copy.deepcopy(self.base_config)
+        profile = "base"
         small = cfg.get("small_cash_profile", {})
         auto = small.get("auto_switch", {})
-        profile = "base"
         threshold = float(auto.get("threshold_orderable_cash_krw", 300000))
-        if bool(small.get("enabled", True)) and (bool(small.get("force_enabled", False)) or (bool(auto.get("enabled", True)) and orderable_cash_krw < threshold)):
+        if bool(small.get("enabled", True)) and (
+            bool(small.get("force_enabled", False))
+            or (bool(auto.get("enabled", True)) and orderable_cash_krw < threshold)
+        ):
             cfg = self._deep_merge(cfg, small.get("overrides", {}))
             profile = "small_cash"
-            risk = cfg.setdefault("risk_limits", {})
+            risk_cfg = cfg.setdefault("risk_limits", {})
             dynamic_max = min(150000.0, max(20000.0, orderable_cash_krw * 0.4))
-            risk["max_positions"] = min(int(risk.get("max_positions", 2)), 2)
-            risk["max_buy_amount_per_trade_krw"] = dynamic_max
-            risk["max_buy_amount_per_trade"] = dynamic_max
+            risk_cfg["max_positions"] = min(int(risk_cfg.get("max_positions", 2)), 2)
+            risk_cfg["max_buy_amount_per_trade_krw"] = dynamic_max
+            risk_cfg["max_buy_amount_per_trade"] = dynamic_max
+
         self.config = cfg
         self.strategy = StageStrategy(self.config)
-        if profile != self.runtime.current_profile:
-            self._record_blocker("PROFILE_SWITCH", None)
+        self.risk.update(self.config)
         self.runtime.current_profile = profile
 
     def tick(self) -> None:
         self._reload_config()
         self._sync_enabled_from_db()
         logger.info("tick start enabled=%s blocker=%s", self.runtime.enabled, self.runtime.blocker or "NONE")
+
         if not self.runtime.enabled:
             logger.info("tick skip reason=DISABLED")
             return
+
         retry_dt = self._parse_iso_utc(self.runtime.blocker_next_retry_at)
         if retry_dt and datetime.now(timezone.utc) < retry_dt:
-            logger.info("tick skip reason=%s next_retry_at=%s", self.runtime.blocker, self.runtime.blocker_next_retry_at)
+            logger.info(
+                "tick skip reason=%s next_retry_at=%s",
+                self.runtime.blocker,
+                self.runtime.blocker_next_retry_at,
+            )
             return
 
         try:
             if self._is_live_mode():
-                self.refresh_portfolio_snapshot(force=False, trigger="tick")
+                refresh = self.refresh_portfolio_snapshot(force=False, trigger="tick")
+                if not bool(refresh.get("ok")) and self.runtime.blocker == "KIS_TOKEN_COOLDOWN":
+                    self.runtime.fatal_error = None
+                    self._restore_last_good_orderable(source="cached")
+                    return
+
             snap = self.get_cached_portfolio_snapshot() or {}
             account = snap.get("account", {}) if isinstance(snap, dict) else {}
             live_orderable, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
-            self.runtime.available_cash = self._money_to_float(account.get("available_cash", live_orderable) if isinstance(account, dict) else live_orderable)
-            self.runtime.d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)) if isinstance(account, dict) else 0)
+            self.runtime.available_cash = self._money_to_float(
+                account.get("available_cash", live_orderable) if isinstance(account, dict) else live_orderable
+            )
+            self.runtime.d2_cash = self._money_to_float(
+                account.get("d2_cash", account.get("d2_deposit", 0)) if isinstance(account, dict) else 0
+            )
             self.runtime.snapshot_warning = str((snap or {}).get("warning") or "")
+
             if live_orderable > 0:
                 self.runtime.orderable_cash = live_orderable
                 self.runtime.orderable_cash_source = source
@@ -280,8 +320,8 @@ class AutoTradingEngine:
             self._apply_profile_by_cash(self.runtime.orderable_cash)
             self._clear_blocker()
         except Exception as exc:
-            is_temp, next_retry = self._is_temporary_kis_error(exc)
-            if is_temp:
+            is_cooldown, next_retry = self._is_cooldown_error(exc)
+            if is_cooldown:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
                 self.runtime.fatal_error = None
                 self._restore_last_good_orderable(source="cached")
@@ -290,8 +330,8 @@ class AutoTradingEngine:
             self._restore_last_good_orderable(source="cached")
             logger.warning("tick skip reason=PORTFOLIO_FETCH_FAIL detail=%s", self.format_exception(exc))
 
-        status = get_market_status()
-        if not status.can_place_order:
+        market = get_market_status()
+        if not market.can_place_order:
             logger.info("tick skip reason=MARKET_CLOSED")
             return
 
@@ -302,19 +342,24 @@ class AutoTradingEngine:
             return
 
         try:
-            self.news_client.update_candidates(force=False)
-            quotes, score_map = self._load_universe_quotes()
-            quotes = self._filter_small_cash_universe(quotes)
-            candidates = self.build_candidates(quotes, external_score_map=score_map)
+            quotes = self._filter_small_cash_universe(self._load_universe_quotes())
+            candidates = self.build_candidates(quotes)
             self.runtime.candidates_count = len(candidates)
             logger.info("tick candidate_count=%s", len(candidates))
-            for c in candidates:
-                self.db.insert_signal(c["symbol"], c["total_score"], json.dumps(c["stage_scores"], ensure_ascii=False), c["pass_fail"], c["reason"])
+            for candidate in candidates:
+                self.db.insert_signal(
+                    candidate["symbol"],
+                    candidate["total_score"],
+                    json.dumps(candidate["stage_scores"], ensure_ascii=False),
+                    candidate["pass_fail"],
+                    candidate["reason"],
+                )
             self._attempt_buy_candidates(candidates)
             self._manage_positions(quotes)
+            self.runtime.fatal_error = None
         except Exception as exc:
-            is_temp, next_retry = self._is_temporary_kis_error(exc)
-            if is_temp:
+            is_cooldown, next_retry = self._is_cooldown_error(exc)
+            if is_cooldown:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
                 self.runtime.fatal_error = None
                 self._restore_last_good_orderable(source="cached")
@@ -324,25 +369,16 @@ class AutoTradingEngine:
             self.runtime.fatal_error = formatted
             self.runtime.enabled = False
             self.db.set_engine_state("auto_trading_enabled", "false")
-            self.notifier.send(f"[치명오류] 자동매매 중지: {formatted[:280]}")
+            self.notifier.send(f"[FATAL] AutoTrade stopped: {formatted[:280]}")
             logger.exception("Fatal engine error: %s", formatted)
 
-    def _load_universe_quotes(self) -> tuple[list[Quote], dict[str, float]]:
-        if self.config.get("news", {}).get("use_news_universe", False):
-            news_candidates = self.news_client.load_candidates()
-            symbols = [x.get("symbol", "") for x in news_candidates if x.get("symbol")]
-            score_map = {x.get("symbol"): float(x.get("score", 0)) for x in news_candidates}
-            return self.kis.fetch_universe_quotes(symbols=symbols), score_map
-        return self.kis.fetch_universe_quotes(), {}
+    def _load_universe_quotes(self) -> list[Quote]:
+        return self.kis.fetch_universe_quotes()
 
     def _filter_small_cash_universe(self, quotes: list[Quote]) -> list[Quote]:
         if self.runtime.current_profile != "small_cash":
             return quotes
-        out = []
-        for q in quotes:
-            if q.price <= 80000 and q.price <= self.runtime.orderable_cash:
-                out.append(q)
-        return out
+        return [q for q in quotes if q.price <= 80000 and q.price <= self.runtime.orderable_cash]
 
     @staticmethod
     def format_exception(exc: Exception) -> str:
@@ -350,19 +386,26 @@ class AutoTradingEngine:
         return f"{err_type}: {message}"
 
     def risk_check_detail(self) -> tuple[bool, str]:
-        risk = self.config["risk_limits"]
-        max_orders_per_day = int(risk.get("max_orders_per_day", risk.get("max_daily_trades", 0)))
-        if max_orders_per_day > 0 and self.runtime.daily_trades >= max_orders_per_day:
-            return False, f"일 주문횟수 제한 도달({self.runtime.daily_trades}/{max_orders_per_day})"
-        return True, "정상"
+        decision = self.risk.check_daily_order_limit(self.runtime.daily_trades)
+        return decision.allowed, decision.reason
 
-    def build_candidates(self, quotes: list[Quote], external_score_map: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    def build_candidates(self, quotes: list[Quote]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for q in quotes:
-            result: ScoreResult = self.strategy.evaluate(q)
-            ext_score = (external_score_map or {}).get(q.symbol, 0.0)
-            rows.append({"symbol": q.symbol, "price": q.price, "total_score": result.total_score + ext_score, "pass_fail": "PASS" if result.passed else "FAIL", "reason": result.reason, "stage_scores": result.stage_scores, "stage_checks": result.stage_checks, "strategy_pass": result.passed, "news_score": ext_score})
-        rows.sort(key=lambda x: (x["total_score"], x.get("news_score", 0), -x.get("price", 0)), reverse=True)
+        for quote in quotes:
+            result: ScoreResult = self.strategy.evaluate(quote)
+            rows.append(
+                {
+                    "symbol": quote.symbol,
+                    "price": quote.price,
+                    "total_score": result.total_score,
+                    "pass_fail": "PASS" if result.passed else "FAIL",
+                    "reason": result.reason,
+                    "stage_scores": result.stage_scores,
+                    "stage_checks": result.stage_checks,
+                    "strategy_pass": result.passed,
+                }
+            )
+        rows.sort(key=lambda row: (row["total_score"], -row.get("price", 0)), reverse=True)
         return rows
 
     def _max_buy_per_trade(self) -> float:
@@ -375,7 +418,8 @@ class AutoTradingEngine:
     def determine_order_qty(self, price: float, available_cash: float) -> int:
         if price <= 0:
             return 0
-        budget = min(available_cash, self._max_buy_per_trade() if self._max_buy_per_trade() > 0 else available_cash)
+        max_buy = self._max_buy_per_trade()
+        budget = min(available_cash, max_buy if max_buy > 0 else available_cash)
         qty = int(budget // price)
         while qty > 0 and self._estimate_cost(price, qty) > budget:
             qty -= 1
@@ -384,7 +428,13 @@ class AutoTradingEngine:
     def check_affordability(self, price: float, qty: int, available_cash: float) -> tuple[bool, str, dict[str, Any]]:
         max_buy = self._max_buy_per_trade()
         estimated_cost = self._estimate_cost(price, qty)
-        detail = {"price": price, "qty": qty, "estimated_cost": estimated_cost, "available_cash": available_cash, "max_buy_amount_per_trade": max_buy}
+        detail = {
+            "price": price,
+            "qty": qty,
+            "estimated_cost": estimated_cost,
+            "available_cash": available_cash,
+            "max_buy_amount_per_trade": max_buy,
+        }
         if available_cash <= 0:
             return False, "CASH_ZERO", detail
         if qty <= 0:
@@ -397,110 +447,58 @@ class AutoTradingEngine:
             return False, "MAX_BUY_EXCEEDED", detail
         return True, "OK", detail
 
-    def get_buy_candidates_preview(self, top_n: int = 10) -> dict[str, Any]:
-        """UI-safe preview. Never calls KIS quote/account APIs.
-
-        Data source priority:
-        1) cached candidates file(news client state)
-        2) recent DB signals fallback
-        """
-        self._reload_config()
-
-        token_status = self.kis.get_token_status()
-        news_state = self.news_client.load_state()
-        cooldown_reason = self.runtime.blocker or news_state.get("blocker") or ""
-        next_retry_at = self.runtime.blocker_next_retry_at or token_status.get("next_retry_at")
-
-        if token_status.get("cooldown_active") or cooldown_reason in {"KIS_TOKEN_COOLDOWN", "PER_MINUTE_CAP_EXCEEDED", "DAILY_CAP_EXCEEDED"}:
-            return {
-                "rows": [],
-                "reason": "KIS token cooldown active",
-                "next_retry_at": next_retry_at,
-                "last_updated_at": news_state.get("last_updated_at"),
-                "next_update_at": news_state.get("next_update_at"),
-            }
-
-        rows: list[dict[str, Any]] = []
-        cached_candidates = self.news_client.load_candidates()
-        if cached_candidates:
-            for c in cached_candidates[:top_n]:
-                rows.append(
-                    {
-                        "symbol": c.get("symbol", ""),
-                        "total_score": float(c.get("score", 0) or 0),
-                        "price_used": None,
-                        "qty": None,
-                        "estimated_cost": None,
-                        "affordable": None,
-                        "reason": "CACHED_CANDIDATE_ONLY",
-                    }
-                )
-        else:
-            try:
-                recent = self.db.fetch_df("SELECT symbol, total_score, reason FROM signals ORDER BY id DESC LIMIT 50")
-            except Exception:
-                recent = None
-            if recent is not None and not recent.empty:
-                dedup: dict[str, dict[str, Any]] = {}
-                for _, r in recent.iterrows():
-                    symbol = str(r.get("symbol", "") or "")
-                    if symbol and symbol not in dedup:
-                        dedup[symbol] = {
-                            "symbol": symbol,
-                            "total_score": float(r.get("total_score", 0) or 0),
-                            "price_used": None,
-                            "qty": None,
-                            "estimated_cost": None,
-                            "affordable": None,
-                            "reason": str(r.get("reason", "") or "CACHED_SIGNAL_ONLY"),
-                        }
-                    if len(dedup) >= top_n:
-                        break
-                rows = list(dedup.values())
-
-        return {
-            "rows": rows,
-            "reason": "OK" if rows else "NO_CACHED_CANDIDATES",
-            "next_retry_at": next_retry_at,
-            "last_updated_at": news_state.get("last_updated_at"),
-            "next_update_at": news_state.get("next_update_at"),
-        }
-
     def _attempt_buy_candidates(self, candidates: list[dict[str, Any]]) -> None:
         account = self.kis.fetch_account_summary()
         available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
         if available_cash <= 0:
             logger.warning("event=BUY_SKIP reason=CASH_ZERO orderable_cash=0 candidates=%s", len(candidates))
             return
-        max_positions = int(self.config.get("risk_limits", {}).get("max_positions", 0) or 0)
-        if max_positions > 0 and len(self.runtime.open_positions) >= max_positions:
+
+        pos_decision = self.risk.check_position_limit(len(self.runtime.open_positions))
+        if not pos_decision.allowed:
             self._record_blocker("MAX_POSITIONS", None)
             return
 
-        for c in candidates:
-            if c["pass_fail"] != "PASS" or c["symbol"] in self.runtime.open_positions:
+        for candidate in candidates:
+            if candidate["pass_fail"] != "PASS" or candidate["symbol"] in self.runtime.open_positions:
                 continue
-            qty = self.determine_order_qty(c["price"], available_cash)
-            ok, reason, _ = self.check_affordability(c["price"], qty, available_cash)
+            qty = self.determine_order_qty(candidate["price"], available_cash)
+            ok, reason, _ = self.check_affordability(candidate["price"], qty, available_cash)
             if not ok:
-                self.runtime.recent_blockers.append({"event": "BUY_SKIP", "reason": reason, "symbol": c["symbol"], "ts": datetime.utcnow().isoformat()})
+                self.runtime.recent_blockers.append(
+                    {
+                        "event": "BUY_SKIP",
+                        "reason": reason,
+                        "symbol": candidate["symbol"],
+                        "ts": datetime.utcnow().isoformat(),
+                    }
+                )
                 continue
-            self._try_entry(c["symbol"], c["price"], c["reason"], qty=qty)
+            self._try_entry(candidate["symbol"], candidate["price"], candidate["reason"], qty=qty)
             return
 
-    def run_manual_diagnosis(self) -> dict[str, Any]:
-        self._reload_config()
-        market = get_market_status()
-        risk_ok, risk_reason = self.risk_check_detail()
-        rows: list[dict[str, Any]] = []
-        try:
-            quotes, score_map = self._load_universe_quotes()
-            candidates = self.build_candidates(quotes, external_score_map=score_map)
-            rows = [{"symbol": c["symbol"], "total_score": c["total_score"], "strategy_pass": c["strategy_pass"], "can_auto_order_now": bool(market.can_place_order and risk_ok and c["strategy_pass"]), "blocker": "없음" if (market.can_place_order and risk_ok and c["strategy_pass"]) else ("시장" if not market.can_place_order else "전략미통과")} for c in candidates]
-        except Exception as exc:
-            err_type, message, detail = unwrap_exception(exc)
-            return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": f"{err_type}: {message}", "error_detail": detail, "rows": rows}
-        return {"market": market, "risk_ok": risk_ok, "risk_reason": risk_reason, "error": None, "error_detail": {}, "rows": rows}
+    def _try_entry(self, symbol: str, price: float, reason: str, qty: int | None = None) -> None:
+        if symbol in self.runtime.open_positions:
+            return
+        order_qty = 1 if qty is None else qty
+        order = self.kis.place_order(symbol=symbol, qty=order_qty, side="BUY", price=price)
+        if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
+            trade_id = self.db.open_trade(symbol, order_qty, price, reason)
+            self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": order_qty}
+            self.runtime.daily_trades += 1
+
+    def _manage_positions(self, quotes: list[Quote]) -> None:
+        exit_cfg = self.config.get("stages", {}).get("exit", {})
+        for quote in quotes:
+            if quote.symbol not in self.runtime.open_positions:
+                continue
+            position = self.runtime.open_positions[quote.symbol]
+            change_pct = (quote.price / position["entry_price"] - 1) * 100
+            if change_pct <= -exit_cfg.get("stop_loss_pct", 1.8) or change_pct >= exit_cfg.get("take_profit_pct", 4.2):
+                order = self.kis.place_order(symbol=quote.symbol, qty=position["qty"], side="SELL", price=quote.price)
+                if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
+                    self.db.close_trade(position["trade_id"], quote.price, fees=500, reason_exit="auto_exit")
+                    del self.runtime.open_positions[quote.symbol]
 
     def get_cached_portfolio_snapshot(self) -> dict[str, Any] | None:
         snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
@@ -510,24 +508,30 @@ class AutoTradingEngine:
         return self.db.clear_report_data(only_dry=only_dry, vacuum=vacuum)
 
     def _is_live_mode(self) -> bool:
-        return bool(self.get_runtime_mode_flags().get("live_order_enabled"))
+        return bool(self.runtime_flags.get("live_order_enabled"))
 
     def refresh_portfolio_snapshot(self, force: bool = False, trigger: str = "manual") -> dict[str, Any]:
         self._reload_config()
         now = time.time()
-        min_gap_sec = 60
-        if trigger == "tick":
-            min_gap_sec = int(self.config.get("portfolio_refresh_interval_sec", 300))
+        min_gap_sec = 60 if trigger == "manual" else int(self.config.get("portfolio_refresh_interval_sec", 300))
         next_allowed = float(self.db.get_engine_state_float("portfolio_refresh_next_retry_epoch", default=0.0))
         if not force and now < next_allowed:
             next_retry_at = datetime.utcfromtimestamp(next_allowed).isoformat()
-            return {"ok": False, "reason": "PORTFOLIO_REFRESH_RATE_LIMIT", "next_retry_at": next_retry_at, "source": "CACHE", "snapshot": self.get_cached_portfolio_snapshot()}
+            return {
+                "ok": False,
+                "reason": "PORTFOLIO_REFRESH_RATE_LIMIT",
+                "next_retry_at": next_retry_at,
+                "source": "CACHE",
+                "snapshot": self.get_cached_portfolio_snapshot(),
+            }
 
         self.db.set_engine_state_float("portfolio_refresh_next_retry_epoch", now + min_gap_sec)
-
         if not self._is_live_mode() and trigger != "tick":
             snap = self.get_cached_portfolio_snapshot() or self.get_portfolio_snapshot(force_refresh=False)
             return {"ok": True, "reason": "DRY_RUN_CACHE", "source": "CACHE", "snapshot": snap}
+
+        if not self._is_live_mode() and trigger == "tick":
+            return {"ok": True, "reason": "SKIP_NON_LIVE_TICK", "source": "CACHE", "snapshot": self.get_cached_portfolio_snapshot()}
 
         try:
             snap = self.get_portfolio_snapshot(force_refresh=True)
@@ -535,23 +539,30 @@ class AutoTradingEngine:
             self.db.set_engine_state("last_portfolio_refresh_at", datetime.utcnow().isoformat())
             return {"ok": True, "reason": "LIVE_REFRESHED", "source": "LIVE", "snapshot": snap}
         except Exception as exc:
-            is_temp, next_retry = self._is_temporary_kis_error(exc)
-            if is_temp:
+            is_cooldown, next_retry = self._is_cooldown_error(exc)
+            if is_cooldown:
                 self._record_blocker("KIS_TOKEN_COOLDOWN", next_retry)
-            cached = self.get_cached_portfolio_snapshot()
-            return {"ok": False, "reason": self.format_exception(exc), "next_retry_at": next_retry, "source": "CACHE", "snapshot": cached}
+            return {
+                "ok": False,
+                "reason": self.format_exception(exc),
+                "next_retry_at": next_retry,
+                "source": "CACHE",
+                "snapshot": self.get_cached_portfolio_snapshot(),
+            }
 
     def get_portfolio_snapshot(self, force_refresh: bool = False) -> dict[str, Any]:
         self._reload_config()
         snap, state = self.portfolio_service.get_snapshot(force_refresh=force_refresh)
         if snap:
             return snap
+
         account = self.kis.fetch_account_summary()
         orderable_cash, source = self._compute_orderable_cash(account if isinstance(account, dict) else {})
         available_cash = self._money_to_float(account.get("available_cash", orderable_cash))
         if available_cash <= 0 and orderable_cash > 0:
             available_cash = orderable_cash
         d2_cash = self._money_to_float(account.get("d2_cash", account.get("d2_deposit", 0)))
+
         warning = ""
         selected_keys = account.get("selected_keys", {}) if isinstance(account.get("selected_keys"), dict) else {}
         if orderable_cash == 0 and d2_cash > 0:
@@ -570,7 +581,7 @@ class AutoTradingEngine:
 
         positions = self.kis.fetch_positions()
         orders = self.kis.fetch_recent_orders(limit=20)
-        snap = {
+        payload = {
             "account": account,
             "orderable_cash": orderable_cash,
             "available_cash": available_cash,
@@ -586,47 +597,5 @@ class AutoTradingEngine:
             "throttle": state,
             "ts": datetime.utcnow().isoformat(),
         }
-        self.portfolio_service.set_cached(snap)
-        return snap
-
-    def get_news_status(self) -> dict[str, Any]:
-        self._reload_config()
-        return {"enabled": True, "provider": self.news_client.cfg.mode, "state": self.news_client.load_state(), "candidate_count": len(self.news_client.load_candidates()), "use_news_universe": bool(self.config.get("news", {}).get("use_news_universe", False))}
-
-    def refresh_news_candidates(self, force: bool = True) -> dict[str, Any]:
-        self._reload_config()
-        return self.news_client.update_candidates(force=force)
-
-    def precheck_manual_buy(self, price: float, qty: int) -> dict[str, Any]:
-        self._reload_config()
-        account = self.kis.fetch_account_summary()
-        available_cash = float(account.get("orderable_cash", account.get("available_cash", 0)) or 0)
-        ok, reason, detail = self.check_affordability(price, qty, available_cash)
-        return {"ok": ok, "reason": reason, **detail}
-
-    def manual_place_order(self, symbol: str, qty: int, side: str, price: float) -> dict[str, Any]:
-        self._reload_config()
-        return self.kis.place_order(symbol=symbol, qty=qty, side=side, price=price)
-
-    def _try_entry(self, symbol: str, price: float, reason: str, qty: int | None = None) -> None:
-        if symbol in self.runtime.open_positions:
-            return
-        qty = 1 if qty is None else qty
-        order = self.kis.place_order(symbol=symbol, qty=qty, side="BUY", price=price)
-        if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
-            trade_id = self.db.open_trade(symbol, qty, price, reason)
-            self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": qty}
-            self.runtime.daily_trades += 1
-
-    def _manage_positions(self, quotes: list[Quote]) -> None:
-        exit_cfg = self.config.get("stages", {}).get("exit", {})
-        for q in quotes:
-            if q.symbol not in self.runtime.open_positions:
-                continue
-            pos = self.runtime.open_positions[q.symbol]
-            change_pct = (q.price / pos["entry_price"] - 1) * 100
-            if change_pct <= -exit_cfg.get("stop_loss_pct", 1.8) or change_pct >= exit_cfg.get("take_profit_pct", 4.2):
-                order = self.kis.place_order(symbol=q.symbol, qty=pos["qty"], side="SELL", price=q.price)
-                if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
-                    self.db.close_trade(pos["trade_id"], q.price, fees=500, reason_exit="auto_exit")
-                    del self.runtime.open_positions[q.symbol]
+        self.portfolio_service.set_cached(payload)
+        return payload
