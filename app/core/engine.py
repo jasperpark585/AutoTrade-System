@@ -237,7 +237,10 @@ class AutoTradingEngine:
             "mode": flags["mode"],
             "dry_run": flags["dry_run"],
             "mock_order": flags["mock_order"],
+            "explicit_live": flags.get("explicit_live", False),
+            "env_dry_run": flags.get("env_dry_run", True),
             "live_order_enabled": flags["live_order_enabled"],
+            "live_block_reasons": flags.get("live_block_reasons", []),
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -506,6 +509,29 @@ class AutoTradingEngine:
 
     def clear_report_data(self, only_dry: bool = True, vacuum: bool = False) -> dict[str, Any]:
         return self.db.clear_report_data(only_dry=only_dry, vacuum=vacuum)
+
+    def get_recent_trades(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.db.fetch_recent_trades(limit=limit)
+
+    def get_config_summary(self) -> dict[str, Any]:
+        cfg = self.cfg_mgr.load()
+        return {
+            "mode": str(cfg.get("mode", "DRY-RUN")),
+            "scan_interval_seconds": int(cfg.get("scan_interval_seconds", 60)),
+            "portfolio_refresh_interval_sec": int(cfg.get("portfolio_refresh_interval_sec", 300)),
+        }
+
+    def set_mode(self, mode: str) -> dict[str, Any]:
+        mode_u = str(mode or "").strip().upper()
+        if mode_u in {"DRY", "DRYRUN", "DRY_RUN"}:
+            mode_u = "DRY-RUN"
+        if mode_u not in {"DRY-RUN", "LIVE"}:
+            raise ValueError("mode must be DRY-RUN or LIVE")
+        cfg = self.cfg_mgr.load()
+        cfg["mode"] = mode_u
+        self.cfg_mgr.save(cfg)
+        self._reload_config()
+        return self.get_config_summary()
 
     def _is_live_mode(self) -> bool:
         return bool(self.runtime_flags.get("live_order_enabled"))

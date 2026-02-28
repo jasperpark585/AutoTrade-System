@@ -228,3 +228,18 @@ class Database:
 
         with self.connect() as con:
             return pd.read_sql_query(query, con)
+
+    def fetch_recent_trades(self, limit: int = 200) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 1000))
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT id, entry_time, exit_time, symbol, qty, entry_price, exit_price,
+                       pnl, pnl_pct, fees, reason_enter, reason_exit, status
+                FROM trades
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]

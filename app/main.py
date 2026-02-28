@@ -46,11 +46,35 @@ class HealthHandler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):  # noqa: N802
-        if self.path not in {"/health", "/status"}:
-            self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})
+        if not self.engine:
+            self._write_json(503, {"ok": False, "reason": "ENGINE_UNAVAILABLE"})
             return
-        payload = {"ok": True, "engine": self.engine.heartbeat() if self.engine else {}}
-        self._write_json(200, payload)
+
+        if self.path in {"/health", "/status"}:
+            payload = {"ok": True, "engine": self.engine.heartbeat()}
+            self._write_json(200, payload)
+            return
+
+        if self.path == "/config":
+            self._write_json(200, {"ok": True, "config": self.engine.get_config_summary()})
+            return
+
+        if self.path.startswith("/trades"):
+            limit = 200
+            if "?" in self.path:
+                try:
+                    query = self.path.split("?", 1)[1]
+                    for part in query.split("&"):
+                        if part.startswith("limit="):
+                            limit = int(part.split("=", 1)[1])
+                            break
+                except Exception:
+                    limit = 200
+            rows = self.engine.get_recent_trades(limit=limit)
+            self._write_json(200, {"ok": True, "rows": rows})
+            return
+
+        self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})
 
     def do_POST(self):  # noqa: N802
         if not self.engine:
@@ -75,6 +99,16 @@ class HealthHandler(BaseHTTPRequestHandler):
             enabled = bool(payload.get("enabled", False))
             self.engine.set_auto_trading_enabled(enabled)
             self._write_json(200, {"ok": True, "enabled": enabled})
+            return
+
+        if self.path == "/config/mode":
+            payload = self._read_json_body()
+            try:
+                saved = self.engine.set_mode(str(payload.get("mode", "")))
+            except Exception as exc:
+                self._write_json(400, {"ok": False, "reason": str(exc)})
+                return
+            self._write_json(200, {"ok": True, "config": saved})
             return
 
         self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})

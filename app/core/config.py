@@ -69,6 +69,15 @@ class ConfigManager:
         explicit_live = _env_bool("LIVE", default=False)
         env_dry = _env_bool("DRY_RUN", default=(mode != "LIVE"))
         mock_order = _env_bool("KIS_MOCK_ORDER", default=False)
+        block_reasons: list[str] = []
+        if mode != "LIVE":
+            block_reasons.append("전략 모드가 LIVE가 아닙니다.")
+        if not explicit_live:
+            block_reasons.append("환경변수 LIVE=true 가 필요합니다.")
+        if env_dry:
+            block_reasons.append("환경변수 DRY_RUN=false 가 필요합니다.")
+        if mock_order:
+            block_reasons.append("환경변수 KIS_MOCK_ORDER=false 가 필요합니다.")
         live_order_enabled = mode == "LIVE" and explicit_live and (not env_dry) and (not mock_order)
         return {
             "mode": mode,
@@ -77,6 +86,7 @@ class ConfigManager:
             "dry_run": not live_order_enabled,
             "mock_order": mock_order,
             "live_order_enabled": live_order_enabled,
+            "live_block_reasons": [] if live_order_enabled else block_reasons,
         }
 
     def save(self, data: dict[str, Any]) -> None:
