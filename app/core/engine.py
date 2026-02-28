@@ -52,6 +52,9 @@ class EngineRuntime:
     watchlist_date_kst: str | None = None
     ai_candidates: list[dict[str, Any]] = field(default_factory=list)
     openai_guard: dict[str, Any] = field(default_factory=dict)
+    candidate_live_prices: dict[str, float] = field(default_factory=dict)
+    candidate_live_prices_updated_at: str | None = None
+    candidate_live_prices_epoch: float = 0.0
     last_hourly_alert_at: str | None = None
 
 
@@ -394,6 +397,62 @@ class AutoTradingEngine:
         self.runtime.watchlist_symbols = symbols
         self.runtime.watchlist_source = "default"
         return symbols
+
+    def _refresh_candidate_live_prices(self, force: bool = False, min_interval_sec: int = 20) -> None:
+        symbols = self._normalize_symbols([row.get("symbol") for row in self.runtime.ai_candidates if isinstance(row, dict)])
+        if not symbols:
+            return
+
+        market = get_market_status()
+        if not market.is_open and not self.runtime.candidate_live_prices:
+            # Outside market hours, avoid repeated quote/token calls when no cached price exists.
+            return
+
+        now_epoch = time.time()
+        if (
+            not force
+            and self.runtime.candidate_live_prices
+            and (now_epoch - float(self.runtime.candidate_live_prices_epoch or 0.0)) < max(1, int(min_interval_sec))
+        ):
+            return
+
+        try:
+            quotes = self.kis.fetch_universe_quotes(symbols=symbols, allow_partial=True)
+        except Exception as exc:
+            logger.warning("candidate live price refresh failed: %s", self.format_exception(exc))
+            return
+
+        price_map: dict[str, float] = {}
+        for quote in quotes:
+            if quote.price > 0:
+                price_map[str(quote.symbol)] = float(quote.price)
+        if not price_map:
+            return
+
+        self.runtime.candidate_live_prices = price_map
+        self.runtime.candidate_live_prices_updated_at = datetime.utcnow().isoformat()
+        self.runtime.candidate_live_prices_epoch = now_epoch
+
+    def _merged_candidates_with_live_prices(self) -> list[dict[str, Any]]:
+        self._refresh_candidate_live_prices(force=False, min_interval_sec=20)
+        out: list[dict[str, Any]] = []
+        live_map = self.runtime.candidate_live_prices
+        for row in self.runtime.ai_candidates:
+            if not isinstance(row, dict):
+                continue
+            merged = dict(row)
+            symbol = "".join(ch for ch in str(merged.get("symbol", "")) if ch.isdigit()).zfill(6)[-6:]
+            old_price = merged.get("price_krw")
+            live_price = live_map.get(symbol)
+            if live_price and live_price > 0:
+                merged["ai_price_krw"] = old_price
+                merged["price_krw"] = float(live_price)
+                merged["price_source"] = "KIS_LIVE"
+                merged["price_updated_at"] = self.runtime.candidate_live_prices_updated_at
+            else:
+                merged["price_source"] = "AI_ESTIMATE"
+            out.append(merged)
+        return out
 
     def heartbeat(self) -> dict[str, Any]:
         flags = self.get_runtime_mode_flags()
@@ -855,13 +914,15 @@ class AutoTradingEngine:
         return self.db.fetch_recent_trades(limit=limit)
 
     def get_watchlist_payload(self) -> dict[str, Any]:
+        candidates = self._merged_candidates_with_live_prices()
         return {
             "symbols": self.runtime.watchlist_symbols,
             "source": self.runtime.watchlist_source,
             "updated_at": self.runtime.watchlist_updated_at,
             "date_kst": self.runtime.watchlist_date_kst,
-            "candidates": self.runtime.ai_candidates,
+            "candidates": candidates,
             "openai_guard": self.runtime.openai_guard,
+            "price_updated_at": self.runtime.candidate_live_prices_updated_at,
         }
 
     def get_symbol_chart(self, symbol: str, count: int = 120) -> dict[str, Any]:

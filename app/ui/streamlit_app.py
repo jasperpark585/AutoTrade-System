@@ -246,7 +246,15 @@ def _render_status_tab() -> dict[str, Any]:
 
     st.markdown("#### 오늘 AI 선정 종목")
     st.write(f"출처: `{cands.get('source', '-')}` / 기준일: `{cands.get('date_kst', '-')}`")
-    st.dataframe(pd.DataFrame(cands.get("candidates", [])), use_container_width=True)
+    price_updated_at = str(cands.get("price_updated_at") or "-")
+    st.caption(f"가격 기준: KIS 실시간 우선 (갱신시각 UTC: {price_updated_at})")
+    cand_df = pd.DataFrame(cands.get("candidates", []))
+    if not cand_df.empty and "price_source" in cand_df.columns:
+        total_count = len(cand_df.index)
+        live_count = int((cand_df["price_source"] == "KIS_LIVE").sum())
+        if live_count < total_count:
+            st.warning("일부 종목은 실시간 시세를 가져오지 못해 추정값(또는 0원)으로 표시됩니다.")
+    st.dataframe(cand_df, use_container_width=True)
     return hb
 
 

@@ -103,6 +103,28 @@ class EngineBuyFlowTests(unittest.TestCase):
         filtered = self.engine._filter_small_cash_universe(quotes)
         self.assertEqual([q.symbol for q in filtered], ["222222"])
 
+    @patch("app.core.engine.get_market_status")
+    def test_watchlist_payload_uses_live_price_when_available(self, mock_market):
+        mock_market.return_value = type("S", (), {"can_place_order": True, "reason": "OPEN", "is_open": True})()
+        self.engine.runtime.ai_candidates = [
+            {
+                "symbol": "005930",
+                "name": "A",
+                "price_krw": 42000,
+                "momentum_score": 70,
+                "pre_breakout_score": 70,
+                "overheat_score": 30,
+            }
+        ]
+        self.engine.kis.fetch_universe_quotes = Mock(
+            return_value=[Quote("005930", 71500, 2.0, 2.0, 110.0, 0.2, 0.4)]
+        )
+        payload = self.engine.get_watchlist_payload()
+        row = payload["candidates"][0]
+        self.assertEqual(row["price_source"], "KIS_LIVE")
+        self.assertEqual(float(row["price_krw"]), 71500.0)
+        self.assertEqual(float(row["ai_price_krw"]), 42000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

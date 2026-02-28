@@ -123,7 +123,7 @@ class KISClient:
         wait=wait_exponential(multiplier=1, min=1, max=8),
         stop=stop_after_attempt(3),
     )
-    def fetch_universe_quotes(self, symbols: list[str] | None = None) -> list[Quote]:
+    def fetch_universe_quotes(self, symbols: list[str] | None = None, allow_partial: bool = False) -> list[Quote]:
         symbols = symbols or os.getenv("KIS_SYMBOLS", "005930,000660,035420,251270,068270,207940").split(",")
         symbols = [s.strip() for s in symbols if s.strip()]
         if self.dry_run:
@@ -133,7 +133,7 @@ class KISClient:
 
         quotes: list[Quote] = []
         for symbol in symbols:
-            quote = self._build_live_quote(symbol)
+            quote = self._build_live_quote(symbol, allow_partial=allow_partial)
             if quote is None:
                 logger.warning("LIVE quote SKIP symbol=%s (insufficient live data)", symbol)
                 continue
@@ -232,10 +232,23 @@ class KISClient:
             "volume": volume,
         }
 
-    def _build_live_quote(self, symbol: str) -> Quote | None:
+    def _build_live_quote(self, symbol: str, allow_partial: bool = False) -> Quote | None:
         price_data = self._fetch_price_full(symbol)
         if not price_data:
-            return None
+            if not allow_partial:
+                return None
+            fallback_close = self._fallback_close_price(symbol)
+            if fallback_close <= 0:
+                return None
+            return Quote(
+                symbol=symbol,
+                price=fallback_close,
+                volume_ratio=1.0,
+                volatility_pct=0.0,
+                execution_strength=100.0,
+                spread_pct=0.2,
+                trend_slope=0.0,
+            )
 
         bid_ask = self._fetch_bid_ask(symbol)
         day_bars = self._fetch_daily_bars(symbol, self.volume_avg_days + 1)
@@ -248,8 +261,25 @@ class KISClient:
         current_volume = float(price_data.get("acml_vol", 0) or 0)
         execution_strength = float(price_data.get("tday_rltv", 0) or 0)
 
-        if current_price <= 0 or open_price <= 0 or high_price <= 0 or low_price <= 0:
+        if current_price <= 0 and allow_partial:
+            current_price = self._fallback_close_price(symbol)
+
+        if current_price <= 0:
             return None
+
+        if open_price <= 0 or high_price <= 0 or low_price <= 0:
+            if not allow_partial:
+                return None
+            fallback_spread = 0.2
+            return Quote(
+                symbol=symbol,
+                price=current_price,
+                volume_ratio=1.0,
+                volatility_pct=0.0,
+                execution_strength=float(execution_strength or 100.0),
+                spread_pct=fallback_spread,
+                trend_slope=0.0,
+            )
 
         spread_pct = calc_spread_pct(bid_ask.get("bid", 0), bid_ask.get("ask", 0)) if bid_ask else None
         if spread_pct is None:
@@ -271,6 +301,20 @@ class KISClient:
             spread_pct=float(spread_pct),
             trend_slope=float(trend_slope),
         )
+
+    def _fallback_close_price(self, symbol: str) -> float:
+        rows = self._fetch_daily_bars(symbol, 2)
+        if not rows:
+            return 0.0
+        row = rows[0] if isinstance(rows[0], dict) else {}
+        for key in ("stck_clpr", "stck_prpr", "ovrs_nmix_prpr", "prpr"):
+            try:
+                value = float(row.get(key, 0) or 0)
+            except Exception:
+                value = 0.0
+            if value > 0:
+                return value
+        return 0.0
 
     def _calc_volume_ratio(self, current_volume: float, day_bars: list[dict[str, Any]]) -> float | None:
         if current_volume <= 0 or len(day_bars) < 2:
