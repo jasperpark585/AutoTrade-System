@@ -5,6 +5,10 @@ Production-focused stock auto trading system for KR market operation:
 - Engine loop (`python -m app.main`)
 - KIS broker integration (token, quotes, account, orders)
 - Risk guardrails (market status, order/position limits, cooldown blocker)
+- Daily pre-market AI scouting (OpenAI) + watchlist auto registration
+- Low-price pre-breakout bias for candidate ranking
+- Position auto-management (stop, take-profit, trailing, weak-trend/time exit)
+- Hourly Kakao status updates during market hours
 - Persistent state/log storage (SQLite + rotating logs)
 - Alerting (Kakao notifier)
 - Minimal operations UI (Streamlit monitor)
@@ -65,6 +69,7 @@ KIS_APPSECRET=...
 KIS_ACCOUNT_NO=12345678-01
 
 KAKAO_TOKEN=...
+OPENAI_API_KEY=...
 
 # order safety flags
 LIVE=false
@@ -110,7 +115,10 @@ sudo systemctl status autotrade-engine autotrade-ui --no-pager
 
 - `GET /health`
 - `GET /status`
+- `GET /candidates`
+- `GET /chart?symbol=005930&count=180`
 - `POST /refresh/portfolio`
+- `POST /candidates/refresh` body: `{"force": true}`
 - `POST /report/clear` body: `{"only_dry": true, "vacuum": false}`
 - `POST /engine/enable` body: `{"enabled": true}`
 
@@ -134,3 +142,14 @@ python -m app.main
 curl -s http://127.0.0.1:8000/status
 streamlit run app/ui/streamlit_app.py --server.port 8501
 ```
+
+## Strategy knobs (strategy.yaml)
+
+- `gpt_scout`:
+  - `allow_external_call=true` 일 때만 OpenAI API 실제 호출
+  - `premarket_refresh_time_kst` 장 시작 전 자동 후보 갱신 시각
+  - `prefer_price_krw`, `price_cap_krw` 저가 우선/고가 패널티
+- `position_management`:
+  - `trailing_stop_pct`, `max_holding_hours`, `weak_trend_exit_slope`
+- `hourly_alert`:
+  - `enabled`, `minute`, `grace_minutes`

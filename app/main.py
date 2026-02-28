@@ -7,6 +7,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from app.core.config import ConfigManager
 from app.core.database import Database
@@ -74,6 +75,26 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._write_json(200, {"ok": True, "rows": rows})
             return
 
+        if self.path == "/candidates":
+            payload = self.engine.get_watchlist_payload()
+            self._write_json(200, {"ok": True, "result": payload})
+            return
+
+        if self.path.startswith("/chart"):
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            symbol = str((params.get("symbol") or [""])[0]).strip()
+            try:
+                count = int((params.get("count") or ["120"])[0])
+            except Exception:
+                count = 120
+            if not symbol:
+                self._write_json(400, {"ok": False, "reason": "symbol is required"})
+                return
+            result = self.engine.get_symbol_chart(symbol=symbol, count=count)
+            self._write_json(200, {"ok": True, "result": result})
+            return
+
         self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})
 
     def do_POST(self):  # noqa: N802
@@ -109,6 +130,13 @@ class HealthHandler(BaseHTTPRequestHandler):
                 self._write_json(400, {"ok": False, "reason": str(exc)})
                 return
             self._write_json(200, {"ok": True, "config": saved})
+            return
+
+        if self.path == "/candidates/refresh":
+            payload = self._read_json_body()
+            force = bool(payload.get("force", True))
+            result = self.engine.refresh_daily_candidates(force=force, trigger="manual")
+            self._write_json(200, {"ok": bool(result.get("ok", True)), "result": result})
             return
 
         self._write_json(404, {"ok": False, "reason": "NOT_FOUND"})

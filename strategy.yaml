@@ -2,6 +2,15 @@ mode: DRY-RUN
 scan_interval_seconds: 60
 portfolio_refresh_interval_sec: 300
 
+universe:
+  default_symbols:
+    - "005930"
+    - "000660"
+    - "035420"
+    - "207940"
+    - "003490"
+    - "012330"
+
 risk_limits:
   max_daily_trades: 8
   max_orders_per_day: 8
@@ -44,3 +53,28 @@ small_cash_profile:
       max_positions: 2
       max_buy_amount_per_trade_krw: 120000
       max_buy_amount_per_trade: 120000
+
+gpt_scout:
+  enabled: true
+  allow_external_call: true
+  premarket_refresh_time_kst: "08:20"
+  max_candidates: 8
+  prefer_price_krw: 40000
+  price_cap_krw: 120000
+  overheat_score_limit: 75
+  overheat_volatility_pct: 6.5
+  notify_on_refresh: true
+  model: "gpt-4.1-mini"
+  user_context: "급등 초기 진입 우선, 이미 과열된 종목 배제"
+
+position_management:
+  trailing_stop_pct: 1.7
+  min_gain_for_trailing_pct: 0.8
+  max_pullback_from_peak_pct: 1.4
+  weak_trend_exit_slope: -0.1
+  max_holding_hours: 18
+
+hourly_alert:
+  enabled: true
+  minute: 0
+  grace_minutes: 8

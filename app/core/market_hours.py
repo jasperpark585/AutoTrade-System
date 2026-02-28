@@ -20,17 +20,17 @@ class MarketStatus:
 
 
 def get_market_status(now: datetime | None = None) -> MarketStatus:
-    now = now.astimezone(KST) if now else datetime.now(KST)
+    current = now.astimezone(KST) if now else datetime.now(KST)
     is_holiday = False
     if holidays is not None:
-        kr_holidays = holidays.country_holidays("KR", years=[now.year])
-        is_holiday = now.date() in kr_holidays
+        kr_holidays = holidays.country_holidays("KR", years=[current.year])
+        is_holiday = current.date() in kr_holidays
 
-    if is_holiday or now.weekday() >= 5:
+    if is_holiday or current.weekday() >= 5:
         return MarketStatus(False, False, "휴장일 또는 주말")
 
     market_open = time(9, 0)
     market_close = time(15, 30)
-    if market_open <= now.time() <= market_close:
+    if market_open <= current.time() <= market_close:
         return MarketStatus(True, True, "정규장")
-    return MarketStatus(False, False, "장마감 또는 장전")
+    return MarketStatus(False, False, "장 시작 전 또는 장 마감 후")

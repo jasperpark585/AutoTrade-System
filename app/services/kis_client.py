@@ -157,6 +157,81 @@ class KISClient:
             )
         return quotes
 
+    def fetch_intraday_bars(self, symbol: str, count: int = 120) -> list[dict[str, Any]]:
+        clean_symbol = str(symbol or "").strip()
+        if not clean_symbol:
+            return []
+        safe_count = max(10, min(int(count), 390))
+        if self.dry_run:
+            return self._simulated_intraday_bars(clean_symbol, safe_count)
+
+        try:
+            bars = self._fetch_minute_bars(clean_symbol, safe_count)
+        except Exception as exc:
+            logger.warning("LIVE intraday bars fetch failed symbol=%s error=%s", clean_symbol, exc)
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for row in bars:
+            one = self._normalize_live_minute_bar(row)
+            if one:
+                normalized.append(one)
+        normalized.sort(key=lambda x: x.get("ts", ""))
+        return normalized
+
+    def _simulated_intraday_bars(self, symbol: str, count: int) -> list[dict[str, Any]]:
+        price = random.uniform(15000, 80000)
+        now = datetime.utcnow()
+        out: list[dict[str, Any]] = []
+        for idx in range(count):
+            step = random.uniform(-0.9, 1.3)
+            open_price = max(1000.0, price)
+            close_price = max(1000.0, open_price + step * random.uniform(40, 220))
+            high_price = max(open_price, close_price) + random.uniform(10, 130)
+            low_price = max(1000.0, min(open_price, close_price) - random.uniform(10, 130))
+            volume = int(random.uniform(1000, 25000))
+            ts = (now - timedelta(minutes=(count - idx))).replace(second=0, microsecond=0).isoformat()
+            out.append(
+                {
+                    "symbol": symbol,
+                    "ts": ts,
+                    "open": round(open_price, 2),
+                    "high": round(high_price, 2),
+                    "low": round(low_price, 2),
+                    "close": round(close_price, 2),
+                    "volume": volume,
+                }
+            )
+            price = close_price
+        return out
+
+    def _normalize_live_minute_bar(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if not isinstance(row, dict):
+            return None
+        close_price = float(row.get("stck_prpr", 0) or 0)
+        if close_price <= 0:
+            return None
+        open_price = float(row.get("stck_oprc", close_price) or close_price)
+        high_price = float(row.get("stck_hgpr", close_price) or close_price)
+        low_price = float(row.get("stck_lwpr", close_price) or close_price)
+        volume = int(float(row.get("cntg_vol", row.get("acml_vol", 0)) or 0))
+
+        date_text = str(row.get("stck_bsop_date", datetime.utcnow().strftime("%Y%m%d")))
+        time_text = str(row.get("stck_cntg_hour", "")).zfill(6)
+        if len(date_text) == 8 and len(time_text) == 6 and date_text.isdigit() and time_text.isdigit():
+            ts = f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}T{time_text[:2]}:{time_text[2:4]}:{time_text[4:6]}"
+        else:
+            ts = datetime.utcnow().replace(second=0, microsecond=0).isoformat()
+
+        return {
+            "ts": ts,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": volume,
+        }
+
     def _build_live_quote(self, symbol: str) -> Quote | None:
         price_data = self._fetch_price_full(symbol)
         if not price_data:

@@ -3,23 +3,27 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.config import ConfigManager
 from app.core.database import Database
-from app.core.market_hours import get_market_status
+from app.core.market_hours import MarketStatus, get_market_status
 from app.core.risk import RiskGuard
 from app.core.strategy import ScoreResult, StageStrategy
+from app.services.gpt_scout import GPTScout
 from app.services.kakao import KakaoNotifier
 from app.services.kis_client import KISClient, KISCooldownError, KISError, Quote
 from app.services.portfolio_service import PortfolioService
 from app.utils.errors import unwrap_exception
 
 logger = logging.getLogger(__name__)
+KST = ZoneInfo("Asia/Seoul")
 
 
 @dataclass
@@ -42,6 +46,18 @@ class EngineRuntime:
     candidates_count: int = 0
     recent_blockers: list[dict[str, Any]] = field(default_factory=list)
     last_portfolio_refresh_epoch: float = 0.0
+    watchlist_symbols: list[str] = field(default_factory=list)
+    watchlist_source: str = "default"
+    watchlist_updated_at: str | None = None
+    watchlist_date_kst: str | None = None
+    ai_candidates: list[dict[str, Any]] = field(default_factory=list)
+    last_hourly_alert_at: str | None = None
+
+
+@dataclass
+class ExitDecision:
+    should_exit: bool
+    reason: str
 
 
 class AutoTradingEngine:
@@ -51,6 +67,7 @@ class AutoTradingEngine:
         self.notifier = notifier
         self.runtime = EngineRuntime()
         self.portfolio_service = PortfolioService()
+        self.gpt_scout = GPTScout()
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self.runtime_flags: dict[str, Any] = {
@@ -64,6 +81,7 @@ class AutoTradingEngine:
         self._reload_config()
         self._check_runtime_writable_paths()
         self._restore_last_good_orderable(source="cached")
+        self._load_watchlist_from_storage()
 
     def _check_runtime_writable_paths(self) -> None:
         targets = [Path("data"), Path("logs"), Path("strategy.yaml")]
@@ -211,8 +229,158 @@ class AutoTradingEngine:
         self.db.set_engine_state("last_good_orderable_at", now_iso)
         self.runtime.orderable_cash_last_updated_at = now_iso
 
+    def _normalize_symbols(self, symbols: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            clean = "".join(ch for ch in str(symbol).strip() if ch.isdigit())
+            if not clean:
+                continue
+            normalized = clean.zfill(6)[-6:]
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+        return out
+
+    def _default_watchlist_symbols(self) -> list[str]:
+        universe_cfg = self.config.get("universe", {})
+        from_cfg = universe_cfg.get("default_symbols") if isinstance(universe_cfg, dict) else None
+        if isinstance(from_cfg, list) and from_cfg:
+            normalized = self._normalize_symbols([str(x) for x in from_cfg])
+            if normalized:
+                return normalized
+        env_symbols = os.getenv("KIS_SYMBOLS", "005930,000660,035420,251270,068270,207940")
+        return self._normalize_symbols([x.strip() for x in env_symbols.split(",") if x.strip()])
+
+    def _update_watchlist_from_payload(self, payload: dict[str, Any], source: str | None = None) -> None:
+        symbols = payload.get("symbols", []) if isinstance(payload.get("symbols"), list) else []
+        normalized = self._normalize_symbols([str(x) for x in symbols])
+        if not normalized:
+            normalized = self._default_watchlist_symbols()
+        self.runtime.watchlist_symbols = normalized
+        self.runtime.watchlist_source = source or str(payload.get("source") or "default")
+        self.runtime.watchlist_updated_at = str(payload.get("generated_at") or payload.get("updated_at") or datetime.utcnow().isoformat())
+        self.runtime.watchlist_date_kst = str(payload.get("date_kst") or datetime.now(KST).date().isoformat())
+        candidates = payload.get("candidates", []) if isinstance(payload.get("candidates"), list) else []
+        self.runtime.ai_candidates = [row for row in candidates if isinstance(row, dict)]
+
+    def _load_watchlist_from_storage(self) -> None:
+        raw = self.db.get_engine_state("daily_watchlist_payload")
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                self._update_watchlist_from_payload(payload)
+                if self.runtime.watchlist_symbols:
+                    return
+
+        cached = self.gpt_scout.get_cached_payload()
+        if isinstance(cached, dict):
+            self._update_watchlist_from_payload(cached)
+            if self.runtime.watchlist_symbols:
+                self.db.set_engine_state("daily_watchlist_payload", json.dumps(cached, ensure_ascii=False))
+                return
+
+        self.runtime.watchlist_symbols = self._default_watchlist_symbols()
+        self.runtime.watchlist_source = "default"
+        self.runtime.watchlist_updated_at = datetime.utcnow().isoformat()
+        self.runtime.watchlist_date_kst = datetime.now(KST).date().isoformat()
+        self.runtime.ai_candidates = []
+
+    def _watchlist_refresh_time(self) -> dt_time:
+        cfg = self.config.get("gpt_scout", {})
+        raw = str(cfg.get("premarket_refresh_time_kst", "08:20"))
+        try:
+            hour_text, minute_text = raw.split(":", 1)
+            return dt_time(hour=int(hour_text), minute=int(minute_text))
+        except Exception:
+            return dt_time(hour=8, minute=20)
+
     def get_runtime_mode_flags(self) -> dict[str, Any]:
         return dict(self.runtime_flags)
+
+    def refresh_daily_candidates(self, force: bool = False, trigger: str = "tick") -> dict[str, Any]:
+        scout_cfg = self.config.get("gpt_scout", {})
+        enabled = bool(scout_cfg.get("enabled", True))
+        defaults = self._default_watchlist_symbols()
+
+        if not enabled:
+            if not self.runtime.watchlist_symbols:
+                self.runtime.watchlist_symbols = defaults
+                self.runtime.watchlist_source = "default"
+                self.runtime.watchlist_updated_at = datetime.utcnow().isoformat()
+            return {
+                "ok": True,
+                "reason": "GPT_SCOUT_DISABLED",
+                "symbols": self.runtime.watchlist_symbols,
+                "source": self.runtime.watchlist_source,
+            }
+
+        now_kst = datetime.now(KST)
+        today_kst = now_kst.date().isoformat()
+        last_date = self.db.get_engine_state("gpt_watchlist_date_kst")
+        refresh_time = self._watchlist_refresh_time()
+        should_refresh = bool(force or (now_kst.time() >= refresh_time and last_date != today_kst))
+
+        if not should_refresh:
+            if not self.runtime.watchlist_symbols:
+                self._load_watchlist_from_storage()
+            return {
+                "ok": True,
+                "reason": "SKIP_ALREADY_REFRESHED",
+                "symbols": self.runtime.watchlist_symbols,
+                "source": self.runtime.watchlist_source,
+                "date_kst": self.runtime.watchlist_date_kst,
+            }
+
+        openai_cfg = dict(scout_cfg)
+        allow_external_call = bool(scout_cfg.get("allow_external_call", False))
+        if allow_external_call:
+            openai_cfg["api_key"] = str(openai_cfg.get("api_key") or os.getenv("OPENAI_API_KEY", "")).strip()
+        else:
+            openai_cfg["api_key"] = ""
+        try:
+            payload = self.gpt_scout.refresh_daily_candidates(openai_cfg, fallback_symbols=defaults)
+            self._update_watchlist_from_payload(payload)
+            self.db.set_engine_state("daily_watchlist_payload", json.dumps(payload, ensure_ascii=False))
+            self.db.set_engine_state("gpt_watchlist_date_kst", str(payload.get("date_kst", today_kst)))
+            self.db.set_engine_state("gpt_watchlist_last_source", str(payload.get("source", "unknown")))
+            if bool(scout_cfg.get("notify_on_refresh", True)):
+                top_symbols = ", ".join(self.runtime.watchlist_symbols[:5]) or "-"
+                self.notifier.send(f"[\uc7a5\uc804 \ud6c4\ubcf4 \ub4f1\ub85d] {payload.get('date_kst')} {top_symbols}")
+            return {
+                "ok": True,
+                "reason": "REFRESHED",
+                "source": payload.get("source"),
+                "symbols": self.runtime.watchlist_symbols,
+                "candidates": self.runtime.ai_candidates,
+                "date_kst": payload.get("date_kst"),
+            }
+        except Exception as exc:
+            logger.warning("daily candidate refresh failed trigger=%s error=%s", trigger, exc)
+            if not self.runtime.watchlist_symbols:
+                self.runtime.watchlist_symbols = defaults
+                self.runtime.watchlist_source = "default_on_error"
+                self.runtime.watchlist_updated_at = datetime.utcnow().isoformat()
+                self.runtime.watchlist_date_kst = today_kst
+            return {
+                "ok": False,
+                "reason": self.format_exception(exc),
+                "symbols": self.runtime.watchlist_symbols,
+                "source": self.runtime.watchlist_source,
+                "date_kst": self.runtime.watchlist_date_kst,
+            }
+
+    def _resolve_watchlist_symbols(self) -> list[str]:
+        if self.runtime.watchlist_symbols:
+            return self.runtime.watchlist_symbols
+        symbols = self._default_watchlist_symbols()
+        self.runtime.watchlist_symbols = symbols
+        self.runtime.watchlist_source = "default"
+        return symbols
 
     def heartbeat(self) -> dict[str, Any]:
         flags = self.get_runtime_mode_flags()
@@ -241,6 +409,12 @@ class AutoTradingEngine:
             "env_dry_run": flags.get("env_dry_run", True),
             "live_order_enabled": flags["live_order_enabled"],
             "live_block_reasons": flags.get("live_block_reasons", []),
+            "watchlist_symbols": self.runtime.watchlist_symbols,
+            "watchlist_source": self.runtime.watchlist_source,
+            "watchlist_updated_at": self.runtime.watchlist_updated_at,
+            "watchlist_date_kst": self.runtime.watchlist_date_kst,
+            "ai_candidates": self.runtime.ai_candidates[:10],
+            "last_hourly_alert_at": self.runtime.last_hourly_alert_at,
             "timestamp": datetime.utcnow().isoformat(),
         }
 
@@ -278,6 +452,7 @@ class AutoTradingEngine:
 
     def tick(self) -> None:
         self._reload_config()
+        self.refresh_daily_candidates(force=False, trigger="tick")
         self._sync_enabled_from_db()
         logger.info("tick start enabled=%s blocker=%s", self.runtime.enabled, self.runtime.blocker or "NONE")
 
@@ -338,6 +513,8 @@ class AutoTradingEngine:
             logger.info("tick skip reason=MARKET_CLOSED")
             return
 
+        self._maybe_send_hourly_portfolio_update(market)
+
         risk_ok, risk_reason = self.risk_check_detail()
         if not risk_ok:
             self._record_blocker("RISK_LIMIT", None)
@@ -376,7 +553,8 @@ class AutoTradingEngine:
             logger.exception("Fatal engine error: %s", formatted)
 
     def _load_universe_quotes(self) -> list[Quote]:
-        return self.kis.fetch_universe_quotes()
+        symbols = self._resolve_watchlist_symbols()
+        return self.kis.fetch_universe_quotes(symbols=symbols)
 
     def _filter_small_cash_universe(self, quotes: list[Quote]) -> list[Quote]:
         if self.runtime.current_profile != "small_cash":
@@ -392,15 +570,35 @@ class AutoTradingEngine:
         decision = self.risk.check_daily_order_limit(self.runtime.daily_trades)
         return decision.allowed, decision.reason
 
+    def _candidate_priority_score(self, quote: Quote, result: ScoreResult) -> float:
+        scout_cfg = self.config.get("gpt_scout", {})
+        prefer_price = float(scout_cfg.get("prefer_price_krw", 40000) or 40000)
+        price_cap = float(scout_cfg.get("price_cap_krw", 120000) or 120000)
+        overheat_vol = float(scout_cfg.get("overheat_volatility_pct", 6.5) or 6.5)
+
+        score = float(result.total_score)
+        if quote.price <= prefer_price:
+            score += 8.0
+        else:
+            premium_ratio = (quote.price - prefer_price) / max(prefer_price, 1.0)
+            score -= min(20.0, premium_ratio * 8.0)
+        if quote.price > price_cap:
+            score -= 25.0
+        if quote.volatility_pct >= overheat_vol:
+            score -= min(20.0, (quote.volatility_pct - overheat_vol) * 4.0)
+        return round(score, 4)
+
     def build_candidates(self, quotes: list[Quote]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for quote in quotes:
             result: ScoreResult = self.strategy.evaluate(quote)
+            priority_score = self._candidate_priority_score(quote, result)
             rows.append(
                 {
                     "symbol": quote.symbol,
                     "price": quote.price,
                     "total_score": result.total_score,
+                    "priority_score": priority_score,
                     "pass_fail": "PASS" if result.passed else "FAIL",
                     "reason": result.reason,
                     "stage_scores": result.stage_scores,
@@ -408,7 +606,7 @@ class AutoTradingEngine:
                     "strategy_pass": result.passed,
                 }
             )
-        rows.sort(key=lambda row: (row["total_score"], -row.get("price", 0)), reverse=True)
+        rows.sort(key=lambda row: (row["priority_score"], row["total_score"], -row.get("price", 0)), reverse=True)
         return rows
 
     def _max_buy_per_trade(self) -> float:
@@ -487,21 +685,133 @@ class AutoTradingEngine:
         order = self.kis.place_order(symbol=symbol, qty=order_qty, side="BUY", price=price)
         if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
             trade_id = self.db.open_trade(symbol, order_qty, price, reason)
-            self.runtime.open_positions[symbol] = {"trade_id": trade_id, "entry_price": price, "qty": order_qty}
+            self.runtime.open_positions[symbol] = {
+                "trade_id": trade_id,
+                "entry_price": price,
+                "qty": order_qty,
+                "opened_at": datetime.utcnow().isoformat(),
+                "highest_price": price,
+            }
             self.runtime.daily_trades += 1
 
-    def _manage_positions(self, quotes: list[Quote]) -> None:
+    def _parse_iso(self, value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _evaluate_exit_decision(self, position: dict[str, Any], quote: Quote) -> ExitDecision:
         exit_cfg = self.config.get("stages", {}).get("exit", {})
+        mgmt_cfg = self.config.get("position_management", {})
+
+        stop_loss_pct = float(exit_cfg.get("stop_loss_pct", 1.8))
+        take_profit_pct = float(exit_cfg.get("take_profit_pct", 4.2))
+        trailing_stop_pct = float(mgmt_cfg.get("trailing_stop_pct", 1.7))
+        weak_trend_exit_slope = float(mgmt_cfg.get("weak_trend_exit_slope", -0.10))
+        max_holding_hours = float(mgmt_cfg.get("max_holding_hours", 18))
+        min_gain_for_trailing = float(mgmt_cfg.get("min_gain_for_trailing_pct", 0.8))
+        max_pullback_pct = float(mgmt_cfg.get("max_pullback_from_peak_pct", 1.4))
+
+        entry_price = float(position.get("entry_price", 0) or 0)
+        if entry_price <= 0:
+            return ExitDecision(True, "INVALID_ENTRY_PRICE")
+
+        highest_price = max(float(position.get("highest_price", entry_price) or entry_price), quote.price)
+        position["highest_price"] = highest_price
+        change_pct = (quote.price / entry_price - 1.0) * 100.0
+        peak_gain_pct = (highest_price / entry_price - 1.0) * 100.0
+        drawdown_from_peak_pct = (quote.price / highest_price - 1.0) * 100.0
+
+        if change_pct <= -abs(stop_loss_pct):
+            return ExitDecision(True, f"STOP_LOSS({change_pct:.2f}%)")
+        if change_pct >= abs(take_profit_pct):
+            return ExitDecision(True, f"TAKE_PROFIT({change_pct:.2f}%)")
+
+        if peak_gain_pct >= min_gain_for_trailing:
+            if drawdown_from_peak_pct <= -abs(min(max_pullback_pct, trailing_stop_pct)):
+                return ExitDecision(
+                    True,
+                    f"TRAILING_STOP(peak={peak_gain_pct:.2f}%,pullback={drawdown_from_peak_pct:.2f}%)",
+                )
+
+        if quote.trend_slope <= weak_trend_exit_slope and change_pct <= 0.5:
+            return ExitDecision(True, f"TREND_WEAKENING(slope={quote.trend_slope:.3f})")
+
+        opened_at = self._parse_iso(position.get("opened_at"))
+        if opened_at and max_holding_hours > 0:
+            held_hours = (datetime.now(timezone.utc) - opened_at).total_seconds() / 3600.0
+            if held_hours >= max_holding_hours and change_pct <= 0.8:
+                return ExitDecision(True, f"TIME_EXIT({held_hours:.1f}h)")
+
+        return ExitDecision(False, "HOLD")
+
+    def _manage_positions(self, quotes: list[Quote]) -> None:
         for quote in quotes:
             if quote.symbol not in self.runtime.open_positions:
                 continue
             position = self.runtime.open_positions[quote.symbol]
-            change_pct = (quote.price / position["entry_price"] - 1) * 100
-            if change_pct <= -exit_cfg.get("stop_loss_pct", 1.8) or change_pct >= exit_cfg.get("take_profit_pct", 4.2):
-                order = self.kis.place_order(symbol=quote.symbol, qty=position["qty"], side="SELL", price=quote.price)
-                if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
-                    self.db.close_trade(position["trade_id"], quote.price, fees=500, reason_exit="auto_exit")
-                    del self.runtime.open_positions[quote.symbol]
+            decision = self._evaluate_exit_decision(position, quote)
+            if not decision.should_exit:
+                continue
+            order = self.kis.place_order(symbol=quote.symbol, qty=position["qty"], side="SELL", price=quote.price)
+            if order.get("status") in {"SIMULATED", "FILLED", "ACCEPTED"}:
+                self.db.close_trade(position["trade_id"], quote.price, fees=500, reason_exit=decision.reason)
+                del self.runtime.open_positions[quote.symbol]
+
+    def _build_hourly_message(self, now_kst: datetime) -> str:
+        snap = self.get_cached_portfolio_snapshot() or {}
+        positions = snap.get("positions", []) if isinstance(snap.get("positions"), list) else []
+        mode = self.runtime_flags.get("mode", "DRY-RUN")
+        lines = [
+            f"[\uc790\ub3d9\ub9e4\ub9e4 \uc2dc\uac04\ubcf4\uace0] {now_kst.strftime('%Y-%m-%d %H:%M')} KST",
+            f"\ubaa8\ub4dc={mode} \ubcf4\uc720\uc885\ubaa9={len(positions)}\uac1c",
+        ]
+        if positions:
+            for row in positions[:5]:
+                symbol = str(row.get("symbol", "-"))
+                qty = int(float(row.get("qty", 0) or 0))
+                pnl_pct = self._money_to_float(row.get("pnl_pct", 0))
+                price = self._money_to_float(row.get("eval_price", row.get("avg_price", 0)))
+                lines.append(
+                    f"- {symbol} {qty}\uc8fc \ud604\uc7ac\uac00 {price:,.0f}\uc6d0 "
+                    f"\uc218\uc775\ub960 {pnl_pct:+.2f}%"
+                )
+        else:
+            lines.append("- \ubcf4\uc720 \uc885\ubaa9 \uc5c6\uc74c")
+        lines.append(f"\uac00\uc6a9\ud604\uae08 {self.runtime.orderable_cash:,.0f}\uc6d0")
+        return "\n".join(lines)
+
+    def _maybe_send_hourly_portfolio_update(self, market: MarketStatus) -> None:
+        if not market.is_open:
+            return
+        cfg = self.config.get("hourly_alert", {})
+        if not bool(cfg.get("enabled", True)):
+            return
+        if not getattr(self.notifier, "token", None):
+            return
+
+        now_kst = datetime.now(KST)
+        send_minute = int(cfg.get("minute", 0))
+        grace_min = int(cfg.get("grace_minutes", 8))
+        if now_kst.minute < send_minute or now_kst.minute >= (send_minute + max(grace_min, 1)):
+            return
+
+        hour_key = now_kst.strftime("%Y%m%d%H")
+        last_key = self.db.get_engine_state("hourly_alert_last_key")
+        if last_key == hour_key:
+            return
+
+        message = self._build_hourly_message(now_kst)
+        if self.notifier.send(message):
+            self.db.set_engine_state("hourly_alert_last_key", hour_key)
+            self.db.set_engine_state("hourly_alert_last_sent_at", now_kst.isoformat())
+            self.runtime.last_hourly_alert_at = now_kst.isoformat()
 
     def get_cached_portfolio_snapshot(self) -> dict[str, Any] | None:
         snap, _ = self.portfolio_service.get_snapshot(force_refresh=False)
@@ -513,12 +823,53 @@ class AutoTradingEngine:
     def get_recent_trades(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.db.fetch_recent_trades(limit=limit)
 
+    def get_watchlist_payload(self) -> dict[str, Any]:
+        return {
+            "symbols": self.runtime.watchlist_symbols,
+            "source": self.runtime.watchlist_source,
+            "updated_at": self.runtime.watchlist_updated_at,
+            "date_kst": self.runtime.watchlist_date_kst,
+            "candidates": self.runtime.ai_candidates,
+        }
+
+    def get_symbol_chart(self, symbol: str, count: int = 120) -> dict[str, Any]:
+        clean = "".join(ch for ch in str(symbol or "") if ch.isdigit()).zfill(6)[-6:]
+        if not clean:
+            return {"symbol": "", "bars": [], "events": [], "reason": "INVALID_SYMBOL"}
+
+        bars = self.kis.fetch_intraday_bars(clean, count=count)
+        trades = self.get_recent_trades(limit=600)
+        events: list[dict[str, Any]] = []
+        for row in trades:
+            if str(row.get("symbol", "")) != clean:
+                continue
+            if row.get("entry_time") and row.get("entry_price"):
+                events.append(
+                    {
+                        "ts": str(row.get("entry_time")),
+                        "price": float(row.get("entry_price")),
+                        "event": "BUY",
+                        "qty": int(float(row.get("qty", 0) or 0)),
+                    }
+                )
+            if row.get("exit_time") and row.get("exit_price"):
+                events.append(
+                    {
+                        "ts": str(row.get("exit_time")),
+                        "price": float(row.get("exit_price")),
+                        "event": "SELL",
+                        "qty": int(float(row.get("qty", 0) or 0)),
+                    }
+                )
+        return {"symbol": clean, "bars": bars, "events": events}
+
     def get_config_summary(self) -> dict[str, Any]:
         cfg = self.cfg_mgr.load()
         return {
             "mode": str(cfg.get("mode", "DRY-RUN")),
             "scan_interval_seconds": int(cfg.get("scan_interval_seconds", 60)),
             "portfolio_refresh_interval_sec": int(cfg.get("portfolio_refresh_interval_sec", 300)),
+            "gpt_scout_enabled": bool(cfg.get("gpt_scout", {}).get("enabled", True)),
         }
 
     def set_mode(self, mode: str) -> dict[str, Any]:

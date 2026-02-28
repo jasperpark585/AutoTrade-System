@@ -7,6 +7,7 @@ from threading import RLock
 from typing import Any
 
 CONFIG_PATH = Path("strategy.yaml")
+ENV_PATH = Path(".env")
 TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -26,12 +27,32 @@ def _normalize_mode(raw: str | None) -> str:
     raise ValueError("mode must be DRY-RUN or LIVE")
 
 
+def _load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        env_key = key.strip()
+        if not env_key:
+            continue
+        env_value = value.strip().strip("'").strip('"')
+        os.environ.setdefault(env_key, env_value)
+
+
 @dataclass
 class ConfigManager:
     path: Path = CONFIG_PATH
 
     def __post_init__(self) -> None:
         self._lock = RLock()
+        _load_dotenv_file(ENV_PATH)
 
     def _read_yaml(self) -> dict[str, Any]:
         try:

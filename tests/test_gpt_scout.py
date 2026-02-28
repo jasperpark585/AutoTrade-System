@@ -1,0 +1,45 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from app.services.gpt_scout import GPTScout, ScoutRankConfig
+
+
+class GPTScoutTests(unittest.TestCase):
+    def test_low_price_candidate_is_prioritized(self):
+        with tempfile.TemporaryDirectory() as td:
+            scout = GPTScout(snapshot_path=str(Path(td) / "gpt_candidates.json"))
+            ranked = scout._rank_candidates(
+                [
+                    {
+                        "symbol": "005930",
+                        "price_krw": 78000,
+                        "momentum_score": 82,
+                        "pre_breakout_score": 84,
+                        "overheat_score": 65,
+                    },
+                    {
+                        "symbol": "003490",
+                        "price_krw": 14500,
+                        "momentum_score": 75,
+                        "pre_breakout_score": 80,
+                        "overheat_score": 28,
+                    },
+                ],
+                ScoutRankConfig(max_candidates=5, prefer_price_krw=40000, price_cap_krw=120000, overheat_score_limit=75),
+            )
+            self.assertEqual(ranked[0]["symbol"], "003490")
+
+    def test_refresh_uses_fallback_when_no_api_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            scout = GPTScout(snapshot_path=str(Path(td) / "gpt_candidates.json"))
+            payload = scout.refresh_daily_candidates(
+                cfg={"max_candidates": 3, "api_key": ""},
+                fallback_symbols=["005930", "000660", "035420"],
+            )
+            self.assertTrue(payload["source"].startswith("FALLBACK"))
+            self.assertTrue(len(payload["symbols"]) >= 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
