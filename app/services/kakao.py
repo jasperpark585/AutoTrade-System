@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 try:
@@ -22,7 +23,12 @@ class KakaoNotifier:
             logger.warning("requests package missing; Kakao notify skipped.")
             return False
         headers = {"Authorization": f"Bearer {self.token}"}
-        payload = {"template_object": '{"object_type":"text","text":"' + message + '","link":{"web_url":"https://example.com"}}'}
+        template_object = {
+            "object_type": "text",
+            "text": str(message or ""),
+            "link": {"web_url": "https://example.com", "mobile_web_url": "https://example.com"},
+        }
+        payload = {"template_object": json.dumps(template_object, ensure_ascii=False)}
         try:
             resp = requests.post("https://kapi.kakao.com/v2/api/talk/memo/default/send", headers=headers, data=payload, timeout=5)
             ok = resp.status_code == 200
