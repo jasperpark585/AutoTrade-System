@@ -51,6 +51,7 @@ class EngineRuntime:
     watchlist_updated_at: str | None = None
     watchlist_date_kst: str | None = None
     ai_candidates: list[dict[str, Any]] = field(default_factory=list)
+    openai_guard: dict[str, Any] = field(default_factory=dict)
     last_hourly_alert_at: str | None = None
 
 
@@ -264,6 +265,8 @@ class AutoTradingEngine:
         self.runtime.watchlist_date_kst = str(payload.get("date_kst") or datetime.now(KST).date().isoformat())
         candidates = payload.get("candidates", []) if isinstance(payload.get("candidates"), list) else []
         self.runtime.ai_candidates = [row for row in candidates if isinstance(row, dict)]
+        guard = payload.get("openai_guard", {}) if isinstance(payload.get("openai_guard"), dict) else {}
+        self.runtime.openai_guard = guard
 
     def _load_watchlist_from_storage(self) -> None:
         raw = self.db.get_engine_state("daily_watchlist_payload")
@@ -289,6 +292,7 @@ class AutoTradingEngine:
         self.runtime.watchlist_updated_at = datetime.utcnow().isoformat()
         self.runtime.watchlist_date_kst = datetime.now(KST).date().isoformat()
         self.runtime.ai_candidates = []
+        self.runtime.openai_guard = {}
 
     def _watchlist_refresh_time(self) -> dt_time:
         cfg = self.config.get("gpt_scout", {})
@@ -304,6 +308,7 @@ class AutoTradingEngine:
 
     def refresh_daily_candidates(self, force: bool = False, trigger: str = "tick") -> dict[str, Any]:
         scout_cfg = self.config.get("gpt_scout", {})
+        self.runtime.openai_guard = self.gpt_scout.get_guard_status(scout_cfg)
         enabled = bool(scout_cfg.get("enabled", True))
         defaults = self._default_watchlist_symbols()
 
@@ -317,6 +322,7 @@ class AutoTradingEngine:
                 "reason": "GPT_SCOUT_DISABLED",
                 "symbols": self.runtime.watchlist_symbols,
                 "source": self.runtime.watchlist_source,
+                "openai_guard": self.runtime.openai_guard,
             }
 
         now_kst = datetime.now(KST)
@@ -334,6 +340,7 @@ class AutoTradingEngine:
                 "symbols": self.runtime.watchlist_symbols,
                 "source": self.runtime.watchlist_source,
                 "date_kst": self.runtime.watchlist_date_kst,
+                "openai_guard": self.runtime.openai_guard,
             }
 
         openai_cfg = dict(scout_cfg)
@@ -358,6 +365,7 @@ class AutoTradingEngine:
                 "symbols": self.runtime.watchlist_symbols,
                 "candidates": self.runtime.ai_candidates,
                 "date_kst": payload.get("date_kst"),
+                "openai_guard": self.runtime.openai_guard,
             }
         except Exception as exc:
             logger.warning("daily candidate refresh failed trigger=%s error=%s", trigger, exc)
@@ -372,6 +380,7 @@ class AutoTradingEngine:
                 "symbols": self.runtime.watchlist_symbols,
                 "source": self.runtime.watchlist_source,
                 "date_kst": self.runtime.watchlist_date_kst,
+                "openai_guard": self.runtime.openai_guard,
             }
 
     def _resolve_watchlist_symbols(self) -> list[str]:
@@ -414,6 +423,7 @@ class AutoTradingEngine:
             "watchlist_updated_at": self.runtime.watchlist_updated_at,
             "watchlist_date_kst": self.runtime.watchlist_date_kst,
             "ai_candidates": self.runtime.ai_candidates[:10],
+            "openai_guard": self.runtime.openai_guard,
             "last_hourly_alert_at": self.runtime.last_hourly_alert_at,
             "timestamp": datetime.utcnow().isoformat(),
         }
@@ -830,6 +840,7 @@ class AutoTradingEngine:
             "updated_at": self.runtime.watchlist_updated_at,
             "date_kst": self.runtime.watchlist_date_kst,
             "candidates": self.runtime.ai_candidates,
+            "openai_guard": self.runtime.openai_guard,
         }
 
     def get_symbol_chart(self, symbol: str, count: int = 120) -> dict[str, Any]:

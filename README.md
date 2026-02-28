@@ -70,12 +70,15 @@ KIS_ACCOUNT_NO=12345678-01
 
 KAKAO_TOKEN=...
 OPENAI_API_KEY=...
+OPENAI_PAID_ALLOWED=false
 
 # order safety flags
 LIVE=false
 DRY_RUN=true
 KIS_MOCK_ORDER=false
 ```
+
+OpenAI 충전/한도 설정은 [docs/openai_billing_guide_ko.md](docs/openai_billing_guide_ko.md)를 참고하세요.
 
 ## Local Run
 
@@ -146,9 +149,15 @@ streamlit run app/ui/streamlit_app.py --server.port 8501
 ## Strategy knobs (strategy.yaml)
 
 - `gpt_scout`:
-  - `allow_external_call=true` 일 때만 OpenAI API 실제 호출
-  - `premarket_refresh_time_kst` 장 시작 전 자동 후보 갱신 시각
-  - `prefer_price_krw`, `price_cap_krw` 저가 우선/고가 패널티
+  - `allow_external_call=true` enables OpenAI call only for scheduled refresh
+  - `premarket_refresh_time_kst` sets daily pre-market refresh time
+  - `prefer_price_krw`, `price_cap_krw` bias low-price/pre-breakout names
+  - `quota_guard` enforces paid safety limits:
+    - `require_paid_opt_in=true` + `paid_opt_in_env=OPENAI_PAID_ALLOWED`
+    - `max_requests_per_day`, `max_requests_per_month`
+    - `max_monthly_cost_usd`, `reserve_ratio`
+    - `max_estimated_cost_per_call_usd`
+    - `cooldown_minutes_on_http_429`
 - `position_management`:
   - `trailing_stop_pct`, `max_holding_hours`, `weak_trend_exit_slope`
 - `hourly_alert`:

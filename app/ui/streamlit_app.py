@@ -142,6 +142,69 @@ def _render_live_readiness(hb: dict[str, Any]) -> None:
     st.caption("필수 조건: mode=LIVE, LIVE=true, DRY_RUN=false, KIS_MOCK_ORDER=false")
 
 
+def _is_truthy_env(name: str) -> bool:
+    raw = str(os.getenv(name, "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _guard_reason_label(reason: str) -> str:
+    reason_map = {
+        "OPENAI_GUARD_OK": "정상",
+        "OPENAI_PAID_OPT_IN_REQUIRED": "유료 호출 미허용(환경변수 미설정)",
+        "OPENAI_GUARD_DAILY_LIMIT": "일일 호출 한도 초과",
+        "OPENAI_GUARD_MONTHLY_LIMIT": "월간 호출 한도 초과",
+        "OPENAI_GUARD_MONTHLY_BUDGET": "월간 예산 한도 초과",
+        "OPENAI_GUARD_PER_CALL_ESTIMATE_LIMIT": "호출당 예상비용 한도 초과",
+        "OPENAI_GUARD_COOLDOWN": "429 이후 쿨다운 차단 중",
+        "OPENAI_HTTP_429": "OpenAI 429(쿼터/요청 제한)",
+    }
+    return reason_map.get(reason, reason or "-")
+
+
+def _render_openai_guard(hb: dict[str, Any], cands: dict[str, Any]) -> None:
+    guard = hb.get("openai_guard", {}) if isinstance(hb.get("openai_guard"), dict) else {}
+    if not guard:
+        guard = cands.get("openai_guard", {}) if isinstance(cands.get("openai_guard"), dict) else {}
+
+    st.markdown("#### OpenAI 쿼터/과금 가드")
+    if not guard:
+        st.info("가드 상태 데이터가 아직 없습니다. `/candidates/refresh` 실행 후 갱신됩니다.")
+        return
+
+    req_today = int(guard.get("requests_today", 0) or 0)
+    req_month = int(guard.get("requests_this_month", 0) or 0)
+    max_day = int(guard.get("max_requests_per_day", 0) or 0)
+    max_month = int(guard.get("max_requests_per_month", 0) or 0)
+    cost_month = float(guard.get("cost_usd_this_month", 0.0) or 0.0)
+    max_budget = float(guard.get("max_monthly_cost_usd", 0.0) or 0.0)
+    reserve_ratio = float(guard.get("reserve_ratio", 0.9) or 0.9)
+    paid_opt_in_env = str(guard.get("paid_opt_in_env") or "OPENAI_PAID_ALLOWED")
+    paid_allowed = _is_truthy_env(paid_opt_in_env)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("오늘 호출", f"{req_today}/{max_day if max_day > 0 else '무제한'}")
+    c2.metric("이번달 호출", f"{req_month}/{max_month if max_month > 0 else '무제한'}")
+    c3.metric("이번달 비용(USD)", f"{cost_month:.4f}/{max_budget if max_budget > 0 else '무제한'}")
+    c4.metric("유료 호출 허용", "허용" if paid_allowed else "차단")
+
+    last_reason = str(guard.get("last_reason") or "")
+    reason_label = _guard_reason_label(last_reason)
+    if last_reason and last_reason not in {"OPENAI_OK", "OPENAI_GUARD_OK"}:
+        st.warning(f"최근 가드 사유: {reason_label}")
+    else:
+        st.success(f"최근 가드 사유: {reason_label}")
+
+    block_until = str(guard.get("block_until_utc") or "").strip()
+    if block_until:
+        kst, utc = format_retry_time_kst(block_until)
+        st.info(f"OpenAI 재시도 가능 시각 (KST): {kst} | UTC: {utc}")
+
+    st.caption(
+        f"예산 보호 배수(reserve_ratio): {reserve_ratio:.2f} | "
+        f"옵트인 환경변수: {paid_opt_in_env}=true 일 때만 유료 호출 허용"
+    )
+
+
 def _render_status_tab() -> dict[str, Any]:
     hb = _safe_call(_get_heartbeat, "엔진 상태 조회", default={}) or {}
     cfg = _safe_call(_get_config, "설정 조회", default={}) or {}
@@ -178,6 +241,7 @@ def _render_status_tab() -> dict[str, Any]:
         st.info(f"KIS 재시도 시각 (KST): {kst} | UTC: {utc}")
 
     _render_live_readiness(hb)
+    _render_openai_guard(hb, cands)
     st.caption(f"마지막 시간보고 알림: {hb.get('last_hourly_alert_at') or '-'}")
 
     st.markdown("#### 오늘 AI 선정 종목")

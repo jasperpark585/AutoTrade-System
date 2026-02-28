@@ -1,6 +1,8 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.services.gpt_scout import GPTScout, ScoutRankConfig
 
@@ -32,13 +34,37 @@ class GPTScoutTests(unittest.TestCase):
 
     def test_refresh_uses_fallback_when_no_api_key(self):
         with tempfile.TemporaryDirectory() as td:
-            scout = GPTScout(snapshot_path=str(Path(td) / "gpt_candidates.json"))
+            scout = GPTScout(
+                snapshot_path=str(Path(td) / "gpt_candidates.json"),
+                guard_state_path=str(Path(td) / "openai_guard_state.json"),
+            )
             payload = scout.refresh_daily_candidates(
                 cfg={"max_candidates": 3, "api_key": ""},
                 fallback_symbols=["005930", "000660", "035420"],
             )
             self.assertTrue(payload["source"].startswith("FALLBACK"))
             self.assertTrue(len(payload["symbols"]) >= 1)
+
+    def test_guard_blocks_without_paid_opt_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            scout = GPTScout(
+                snapshot_path=str(Path(td) / "gpt_candidates.json"),
+                guard_state_path=str(Path(td) / "openai_guard_state.json"),
+            )
+            cfg = {
+                "max_candidates": 3,
+                "api_key": "dummy-key",
+                "quota_guard": {
+                    "enabled": True,
+                    "require_paid_opt_in": True,
+                    "paid_opt_in_env": "OPENAI_PAID_ALLOWED_TEST",
+                },
+            }
+            with patch.dict(os.environ, {"OPENAI_PAID_ALLOWED_TEST": "false"}, clear=False):
+                payload = scout.refresh_daily_candidates(cfg=cfg, fallback_symbols=["005930", "000660", "035420"])
+            self.assertEqual(payload["source"], "FALLBACK:OPENAI_PAID_OPT_IN_REQUIRED")
+            guard = payload.get("openai_guard", {})
+            self.assertTrue(bool(guard.get("require_paid_opt_in")))
 
 
 if __name__ == "__main__":

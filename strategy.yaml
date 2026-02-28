@@ -59,6 +59,7 @@ gpt_scout:
   allow_external_call: true
   premarket_refresh_time_kst: "08:20"
   max_candidates: 8
+  max_output_tokens: 900
   prefer_price_krw: 40000
   price_cap_krw: 120000
   overheat_score_limit: 75
@@ -66,6 +67,21 @@ gpt_scout:
   notify_on_refresh: true
   model: "gpt-4.1-mini"
   user_context: "급등 초기 진입 우선, 이미 과열된 종목 배제"
+  quota_guard:
+    enabled: true
+    require_paid_opt_in: true
+    paid_opt_in_env: "OPENAI_PAID_ALLOWED"
+    max_requests_per_day: 3
+    max_requests_per_month: 40
+    max_monthly_cost_usd: 5.0
+    reserve_ratio: 0.9
+    max_estimated_cost_per_call_usd: 0.30
+    estimated_prompt_tokens_per_call: 1200
+    estimated_completion_tokens_per_call: 500
+    cooldown_minutes_on_http_429: 360
+    pricing_per_1m_tokens:
+      input_usd: 0.40
+      output_usd: 1.60
 
 position_management:
   trailing_stop_pct: 1.7
