@@ -1,5 +1,6 @@
 import unittest
 
+from app.core.cross_signals import MIDLONG_DEAD_CROSS, MIDLONG_GOLDEN_CROSS
 from app.core.strategy import StageStrategy
 from app.services.kis_client import Quote
 
@@ -43,6 +44,25 @@ class StrategyCrossSignalTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertFalse(result.stage_checks["confirmation"]["passed"])
         self.assertIn("DEAD_CROSS", result.reason)
+
+    def test_midlong_golden_cross_is_primary_bonus(self):
+        strategy = StageStrategy(_config())
+        quote = Quote("005930", 70000, 3.0, 2.3, 120.0, 0.2, 0.4, cross_signal=MIDLONG_GOLDEN_CROSS)
+
+        result = strategy.evaluate(quote)
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.stage_scores["cross"], 8)
+        self.assertIn(MIDLONG_GOLDEN_CROSS, result.reason)
+
+    def test_midlong_dead_cross_blocks_entry(self):
+        strategy = StageStrategy(_config())
+        quote = Quote("005930", 70000, 3.0, 2.3, 120.0, 0.2, 0.4, cross_signal=MIDLONG_DEAD_CROSS)
+
+        result = strategy.evaluate(quote)
+
+        self.assertFalse(result.passed)
+        self.assertIn(MIDLONG_DEAD_CROSS, result.reason)
 
 
 if __name__ == "__main__":

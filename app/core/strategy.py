@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from app.core.cross_signals import DEAD_CROSS, GOLDEN_CROSS
+from app.core.cross_signals import DEAD_CROSS, GOLDEN_CROSS, MIDLONG_DEAD_CROSS, MIDLONG_GOLDEN_CROSS
 from app.services.kis_client import Quote
 
 
@@ -79,7 +79,8 @@ class StageStrategy:
 
         confirm_cfg = self.stages["confirmation"]
         cross_signal = str(getattr(q, "cross_signal", "") or "")
-        dead_cross_blocked = bool(confirm_cfg.get("block_dead_cross", True)) and cross_signal == DEAD_CROSS
+        bearish_crosses = {DEAD_CROSS, MIDLONG_DEAD_CROSS}
+        dead_cross_blocked = bool(confirm_cfg.get("block_dead_cross", True)) and cross_signal in bearish_crosses
         confirm_pass = (
             q.execution_strength >= confirm_cfg["execution_strength_min"]
             and q.spread_pct <= confirm_cfg["spread_pct_max"]
@@ -99,20 +100,23 @@ class StageStrategy:
         }
 
         cross_bonus = float(confirm_cfg.get("golden_cross_bonus", 5) or 0)
-        stage_scores["cross"] = cross_bonus if cross_signal == GOLDEN_CROSS else 0.0
+        midlong_bonus = float(confirm_cfg.get("midlong_golden_cross_bonus", 8) or 0)
+        stage_scores["cross"] = midlong_bonus if cross_signal == MIDLONG_GOLDEN_CROSS else cross_bonus if cross_signal == GOLDEN_CROSS else 0.0
         stage_checks["cross"] = {
-            "passed": cross_signal == GOLDEN_CROSS,
+            "passed": cross_signal in {GOLDEN_CROSS, MIDLONG_GOLDEN_CROSS},
             "score": stage_scores["cross"],
-            "max_score": cross_bonus,
+            "max_score": max(cross_bonus, midlong_bonus),
             "reason": cross_signal or "no moving-average cross",
         }
 
         total = float(sum(stage_scores.values()))
         passed = bool(total >= 65.0 and pre_pass and confirm_pass)
         if dead_cross_blocked:
-            reason = f"blocked by {DEAD_CROSS}"
-        elif cross_signal == GOLDEN_CROSS and passed:
+            reason = f"blocked by {cross_signal}"
+        elif cross_signal in {GOLDEN_CROSS, MIDLONG_GOLDEN_CROSS} and passed:
             reason = f"strategy passed with {GOLDEN_CROSS}"
+            if cross_signal == MIDLONG_GOLDEN_CROSS:
+                reason = f"strategy passed with {MIDLONG_GOLDEN_CROSS}"
         else:
             reason = "strategy passed" if passed else "score or confirmation condition not met"
         return ScoreResult(passed=passed, total_score=total, stage_scores=stage_scores, reason=reason, stage_checks=stage_checks)

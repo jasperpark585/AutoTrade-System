@@ -134,10 +134,14 @@ streamlit run app/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.
 
 ## Cross Strategy
 
-`app/core/cross_signals.py` calculates golden/dead cross signals with the default `5/20` moving averages.
+`app/core/cross_signals.py` calculates short-term moving-average crosses and the mid/long-term leading-span rule from the reference material.
 
 - `GOLDEN_CROSS`: the short moving average crosses above the long moving average. The strategy adds a confirmation bonus.
 - `DEAD_CROSS`: the short moving average crosses below the long moving average. The strategy blocks new entries by default.
+- `MIDLONG_GOLDEN_CROSS`: the 20-period moving average crosses above Ichimoku Senkou Span 2, calculated from the 52-period high/low midpoint. The strategy treats this as the primary mid/long-term bottoming signal.
+- `MIDLONG_DEAD_CROSS`: the 20-period moving average crosses below Senkou Span 2. The strategy blocks new entries.
+- The signal candle high/low is returned as resistance/support levels so the chart can draw future reference lines.
+- KIS daily chart requests use original prices (`FID_ORG_ADJ_PRC=1`) so split-adjusted historical prices do not distort these support and resistance levels.
 - The chart API returns `cross_signals`, `ma_short`, and `ma_long`; the UI renders the signals as diamond markers.
 
 ## 에이전트 하네스

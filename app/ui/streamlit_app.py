@@ -366,7 +366,7 @@ def _render_chart_tab() -> None:
     df = pd.DataFrame(bars)
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
     df = df.dropna(subset=["ts", "close"]).sort_values("ts")
-    ma_cols = [col for col in ["ma_short", "ma_long"] if col in df.columns]
+    ma_cols = [col for col in ["ma_short", "ma_long", "ma20", "senkou_span2"] if col in df.columns]
     ma_df = (
         df.melt(id_vars=["ts"], value_vars=ma_cols, var_name="average", value_name="average_price").dropna(subset=["average_price"])
         if ma_cols
@@ -387,7 +387,13 @@ def _render_chart_tab() -> None:
         ma_line = alt.Chart(ma_df).mark_line(strokeDash=[6, 3], strokeWidth=1.8).encode(
             x="ts:T",
             y="average_price:Q",
-            color=alt.Color("average:N", scale=alt.Scale(domain=["ma_short", "ma_long"], range=["#f59e0b", "#2563eb"])),
+            color=alt.Color(
+                "average:N",
+                scale=alt.Scale(
+                    domain=["ma_short", "ma_long", "ma20", "senkou_span2"],
+                    range=["#f59e0b", "#2563eb", "#111827", "#dc2626"],
+                ),
+            ),
             tooltip=["ts:T", "average:N", "average_price:Q"],
         )
         layers.append(ma_line)
@@ -403,10 +409,26 @@ def _render_chart_tab() -> None:
         signal_points = alt.Chart(sig).mark_point(filled=True, size=230, shape="diamond").encode(
             x="ts:T",
             y="price:Q",
-            color=alt.Color("signal:N", scale=alt.Scale(domain=["GOLDEN_CROSS", "DEAD_CROSS"], range=["#f59e0b", "#7f1d1d"])),
-            tooltip=["ts:T", "signal:N", "price:Q", "ma_short:Q", "ma_long:Q"],
+            color=alt.Color(
+                "signal:N",
+                scale=alt.Scale(
+                    domain=["GOLDEN_CROSS", "DEAD_CROSS", "MIDLONG_GOLDEN_CROSS", "MIDLONG_DEAD_CROSS"],
+                    range=["#f59e0b", "#7f1d1d", "#16a34a", "#dc2626"],
+                ),
+            ),
+            tooltip=["ts:T", "signal:N", "price:Q", "ma20:Q", "senkou_span2:Q", "support_low:Q", "resistance_high:Q"],
         )
         layers.append(signal_points)
+        levels = sig[sig["signal"].isin(["MIDLONG_GOLDEN_CROSS", "MIDLONG_DEAD_CROSS"])].copy()
+        level_cols = [col for col in ["support_low", "resistance_high"] if col in levels.columns]
+        if not levels.empty and level_cols:
+            level_df = levels.melt(id_vars=["signal", "ts"], value_vars=level_cols, var_name="level", value_name="level_price").dropna(subset=["level_price"])
+            level_rules = alt.Chart(level_df).mark_rule(strokeDash=[3, 3], opacity=0.45).encode(
+                y="level_price:Q",
+                color=alt.Color("level:N", scale=alt.Scale(domain=["support_low", "resistance_high"], range=["#16a34a", "#dc2626"])),
+                tooltip=["signal:N", "level:N", "level_price:Q"],
+            )
+            layers.append(level_rules)
     st.altair_chart(alt.layer(*layers).properties(height=380), width="stretch")
 
 

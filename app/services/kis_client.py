@@ -359,10 +359,12 @@ class KISClient:
         normalized: list[dict[str, Any]] = []
         for idx, row in enumerate(minute_bars):
             close = row.get("close", row.get("stck_prpr"))
+            high = row.get("high", row.get("stck_hgpr", close))
+            low = row.get("low", row.get("stck_lwpr", close))
             date_text = str(row.get("stck_bsop_date", ""))
             time_text = str(row.get("stck_cntg_hour", ""))
             ts = str(row.get("ts") or f"{date_text}{time_text}" or idx)
-            normalized.append({"ts": ts, "close": close})
+            normalized.append({"ts": ts, "high": high, "low": low, "close": close})
         normalized.sort(key=lambda row: str(row.get("ts", "")))
         enriched, signals = enrich_bars_with_cross_signals(normalized)
         latest = enriched[-1] if enriched else {}
@@ -595,6 +597,7 @@ class KISClient:
             "fid_cond_mrkt_div_code": "J",
             "fid_input_iscd": symbol,
             "fid_period_div_code": "D",
+            # 1 means original, unadjusted prices in KIS chart APIs. This matches the mid/long-term signal rule.
             "fid_org_adj_prc": "1",
         }
         data = self._request_json("GET", url, headers=headers, params=params)
