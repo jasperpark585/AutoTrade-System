@@ -38,6 +38,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from app.core.market_hours import get_market_status
 from app.core.credentials import BrokerCredentials
+from app.core.cross_signals import enrich_bars_with_cross_signals
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class Quote:
     execution_strength: float
     spread_pct: float
     trend_slope: float
+    cross_signal: str = ""
+    ma_short: float | None = None
+    ma_long: float | None = None
 
 
 def calc_spread_pct(bid: float, ask: float) -> float | None:
@@ -301,6 +305,7 @@ class KISClient:
         volume_ratio = self._calc_volume_ratio(current_volume, day_bars)
         volatility_pct = ((high_price - low_price) / open_price) * 100 if open_price > 0 else 0
         trend_slope = self._calc_trend_slope(minute_bars)
+        cross_signal, ma_short, ma_long = self._calc_latest_cross_signal(minute_bars)
 
         if volume_ratio is None or trend_slope is None:
             return None
@@ -313,6 +318,9 @@ class KISClient:
             execution_strength=float(execution_strength),
             spread_pct=float(spread_pct),
             trend_slope=float(trend_slope),
+            cross_signal=cross_signal,
+            ma_short=ma_short,
+            ma_long=ma_long,
         )
 
     def _fallback_close_price(self, symbol: str) -> float:
@@ -346,6 +354,20 @@ class KISClient:
         if len(closes) < 2:
             return None
         return calc_trend_slope(closes)
+
+    def _calc_latest_cross_signal(self, minute_bars: list[dict[str, Any]]) -> tuple[str, float | None, float | None]:
+        normalized: list[dict[str, Any]] = []
+        for idx, row in enumerate(minute_bars):
+            close = row.get("close", row.get("stck_prpr"))
+            date_text = str(row.get("stck_bsop_date", ""))
+            time_text = str(row.get("stck_cntg_hour", ""))
+            ts = str(row.get("ts") or f"{date_text}{time_text}" or idx)
+            normalized.append({"ts": ts, "close": close})
+        normalized.sort(key=lambda row: str(row.get("ts", "")))
+        enriched, signals = enrich_bars_with_cross_signals(normalized)
+        latest = enriched[-1] if enriched else {}
+        signal = str(signals[-1].get("signal", "")) if signals and signals[-1].get("ts") == latest.get("ts") else ""
+        return signal, latest.get("ma_short"), latest.get("ma_long")
 
     @retry(
         retry=retry_if_exception_type(KISError),

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from app.core.config import ConfigManager
 from app.core.credentials import BrokerCredentials, CredentialStore
+from app.core.cross_signals import enrich_bars_with_cross_signals
 from app.core.database import Database
 from app.core.market_hours import MarketStatus, get_market_status
 from app.core.risk import RiskGuard
@@ -735,6 +736,9 @@ class AutoTradingEngine:
                     "stage_scores": result.stage_scores,
                     "stage_checks": result.stage_checks,
                     "strategy_pass": result.passed,
+                    "cross_signal": getattr(quote, "cross_signal", ""),
+                    "ma_short": getattr(quote, "ma_short", None),
+                    "ma_long": getattr(quote, "ma_long", None),
                 }
             )
         rows.sort(key=lambda row: (row["priority_score"], row["total_score"], -row.get("price", 0)), reverse=True)
@@ -972,6 +976,7 @@ class AutoTradingEngine:
             return {"symbol": "", "bars": [], "events": [], "reason": "INVALID_SYMBOL"}
 
         bars = self.kis.fetch_intraday_bars(clean, count=count)
+        bars, cross_signals = enrich_bars_with_cross_signals(bars)
         trades = self.get_recent_trades(limit=600)
         events: list[dict[str, Any]] = []
         for row in trades:
@@ -995,7 +1000,7 @@ class AutoTradingEngine:
                         "qty": int(float(row.get("qty", 0) or 0)),
                     }
                 )
-        return {"symbol": clean, "bars": bars, "events": events}
+        return {"symbol": clean, "bars": bars, "events": events, "cross_signals": cross_signals}
 
     def get_config_summary(self) -> dict[str, Any]:
         cfg = self.cfg_mgr.load()

@@ -132,6 +132,14 @@ streamlit run app/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.
 3. file snapshot
 4. session last snapshot
 
+## Cross Strategy
+
+`app/core/cross_signals.py` calculates golden/dead cross signals with the default `5/20` moving averages.
+
+- `GOLDEN_CROSS`: the short moving average crosses above the long moving average. The strategy adds a confirmation bonus.
+- `DEAD_CROSS`: the short moving average crosses below the long moving average. The strategy blocks new entries by default.
+- The chart API returns `cross_signals`, `ma_short`, and `ma_long`; the UI renders the signals as diamond markers.
+
 ## 에이전트 하네스
 
 `app/agents/ops_harness.py`는 읽기 전용 운영 점검 하네스입니다. 실계좌 주문, 설정 변경, 파일 변경을 하지 않습니다. OpenAI Agents SDK로 확장할 때도 이 하네스는 “상태 요약과 권고”까지만 담당하고, 주문 실행은 엔진의 기존 안전 플래그와 수동 승인 경계를 통과해야 합니다.

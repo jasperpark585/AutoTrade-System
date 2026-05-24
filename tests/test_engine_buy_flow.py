@@ -129,6 +129,21 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertEqual(float(row["price_krw"]), 71500.0)
         self.assertEqual(float(row["ai_price_krw"]), 42000.0)
 
+    def test_symbol_chart_includes_cross_signals(self):
+        closes = [30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 16, 17, 18, 20, 22, 24, 26, 28, 30, 32]
+        self.engine.kis.fetch_intraday_bars = Mock(
+            return_value=[
+                {"ts": f"2026-05-24T09:{idx:02d}:00", "open": close, "high": close, "low": close, "close": close, "volume": 1000}
+                for idx, close in enumerate(closes)
+            ]
+        )
+
+        payload = self.engine.get_symbol_chart("005930", count=60)
+
+        self.assertTrue(payload["cross_signals"])
+        self.assertIn("ma_short", payload["bars"][-1])
+        self.assertIn("ma_long", payload["bars"][-1])
+
     def test_reload_config_skips_immediate_duplicate_load(self):
         cfg = DummyConfigManager()
         engine = AutoTradingEngine(cfg, self.db, KakaoNotifier(None))

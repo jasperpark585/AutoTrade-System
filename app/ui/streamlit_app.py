@@ -358,6 +358,7 @@ def _render_chart_tab() -> None:
     chart_data = _safe_call(lambda: _get_chart(symbol), "차트 조회", default={}) or {}
     bars = chart_data.get("bars", []) if isinstance(chart_data.get("bars"), list) else []
     events = chart_data.get("events", []) if isinstance(chart_data.get("events"), list) else []
+    cross_signals = chart_data.get("cross_signals", []) if isinstance(chart_data.get("cross_signals"), list) else []
     if not bars:
         st.warning("차트 데이터가 없습니다.")
         return
@@ -365,13 +366,31 @@ def _render_chart_tab() -> None:
     df = pd.DataFrame(bars)
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
     df = df.dropna(subset=["ts", "close"]).sort_values("ts")
+    ma_cols = [col for col in ["ma_short", "ma_long"] if col in df.columns]
+    ma_df = (
+        df.melt(id_vars=["ts"], value_vars=ma_cols, var_name="average", value_name="average_price").dropna(subset=["average_price"])
+        if ma_cols
+        else pd.DataFrame()
+    )
     ev = pd.DataFrame(events)
     if not ev.empty:
         ev["ts"] = pd.to_datetime(ev["ts"], errors="coerce")
         ev = ev.dropna(subset=["ts", "price"])
+    sig = pd.DataFrame(cross_signals)
+    if not sig.empty:
+        sig["ts"] = pd.to_datetime(sig["ts"], errors="coerce")
+        sig = sig.dropna(subset=["ts", "price"])
 
     line = alt.Chart(df).mark_line(color="#334155", strokeWidth=2).encode(x="ts:T", y=alt.Y("close:Q", title="가격"))
     layers = [line]
+    if not ma_df.empty:
+        ma_line = alt.Chart(ma_df).mark_line(strokeDash=[6, 3], strokeWidth=1.8).encode(
+            x="ts:T",
+            y="average_price:Q",
+            color=alt.Color("average:N", scale=alt.Scale(domain=["ma_short", "ma_long"], range=["#f59e0b", "#2563eb"])),
+            tooltip=["ts:T", "average:N", "average_price:Q"],
+        )
+        layers.append(ma_line)
     if not ev.empty:
         points = alt.Chart(ev).mark_point(filled=True, size=170).encode(
             x="ts:T",
@@ -380,6 +399,14 @@ def _render_chart_tab() -> None:
             tooltip=["ts:T", "event:N", "price:Q", "qty:Q"],
         )
         layers.append(points)
+    if not sig.empty:
+        signal_points = alt.Chart(sig).mark_point(filled=True, size=230, shape="diamond").encode(
+            x="ts:T",
+            y="price:Q",
+            color=alt.Color("signal:N", scale=alt.Scale(domain=["GOLDEN_CROSS", "DEAD_CROSS"], range=["#f59e0b", "#7f1d1d"])),
+            tooltip=["ts:T", "signal:N", "price:Q", "ma_short:Q", "ma_long:Q"],
+        )
+        layers.append(signal_points)
     st.altair_chart(alt.layer(*layers).properties(height=380), width="stretch")
 
 
