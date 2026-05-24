@@ -1,0 +1,56 @@
+UCVSxWJTq7iuesgIyxrO8HTA 복지정보채널
+UCtMnPbVMIJP09T-d_NHLkbQ  NewsTrend 채널
+UCWsjdJoJcr-Szv4EZabE8OQ 명언이간다 채널
+UCqBGwk38wrT5ac0If2HD1Hw 롱폼인생사연 채널
+
+
+
+
+NewsTrend → https://www.youtube.com/watch?v=Ye9mc1M-l-c
+쇼츠형태로 고정
+복지정보채널 → https://www.youtube.com/watch?v=9-kRZfzDQrg
+쇼츠형태로 고정 복지->뉴스영상삭제
+명언이간다 → https://www.youtube.com/watch?v=3jx6-1piRXw
+쇼츠형태로 내용 ok
+인생사연 채널 → https://www.youtube.com/watch?v=hD656sBUOXY
+유튜브영상ok 명언1개 업로드 삭제 확인필요 
+유튜브대본내용 
+화면해설 삭제
+
+
+python main.py --mode auth-youtube --channel-id insight_default
+python main.py --mode auth-youtube --channel-id story_default
+python main.py --mode delete-youtube-video --channel-id insight_default --video-id UWDi6q5K3Jg
+python main.py --mode delete-youtube-video --channel-id story_default --video-id OJN91diKqcM
+
+명언쇼츠영상
+영상1개에 1가지 명언으로 알려주는 컨셉
+화면에는 1가지 명언에 대한 설명과 명언 출처표시. 명언내용 전체가 화면에 표시되게.
+
+뉴스쇼츠
+뉴스정보가 아닌 주제검색이나 내용 분류규칙등에 대한 내용을 브리핑하고 있는데 과정절차 내용은 제외해줘
+"이 뉴스 나한테 영향이 있습니다"이런게 들어가면 안돼.
+연합뉴스에처라던지 어디 출처를 얘기하지말고 검색된 내용에 대해 저작권 안걸리게 각색만해서 자연스럽게 뉴스내용만 보도되도록해줘.
+
+뉴스쇼츠 제목만 단순 읽고 있는데 선정된 주제에 따른 내용도 설명해줘. 주제에 따른 여러 제목을 알려주기 보다는
+주제에맞는 제목 한가지만 선택하고 해당 주제에 맞는 상세 내용 1가지만 이해되기 쉽게 풀어서 브리핑 해줘.
+
+뉴스제목 및 내용에 다른데에서 발췌한 이름이 기재안되게 해줘.
+
+
+인생사연
+이미지에 제작정책내용같은것은 표시안되게 해줘.
+장면에대한 부가 설명이 안나오게 해줘.
+시청자는 어떤부분으로 떠올리게 됩니다라는 스토리하고 상관없는 부가적인 설명은 전부 제거해줘.
+30초까지 초반설명나오고 이후 3분까지 아무 내용없이 빈재생되다가 3분이후부터 다시 내용이 나오는 오류가 있어.
+
+41분부터45분까지 무음발생구간 확인되고 50분에서 52분에도 무음구간이 확인되고 있어, 다른구간에도 이런 구간이 많이 있어, 이런 오류는 발생하지 않도록 해줘.
+이야기 중간에 시"청자는 여기에서 이결을 읽게 됩니다" 라는 식의 해설자의 생각이 안들어가게 해줘.
+처음과 마지막 나레이션 멘트정리멘트만 나오게 해줘.
+화면 음성하고 표시되는 자막하고 안맞아.
+
+복지쇼츠
+정보 제목만 몇개 읽고 있는데 한가지 영상에 한가지 주제로 자세한 설명이 이루어 지도록 해줘.
+
+영상제작내용이 전체적으로 해당 주제에맞는 이야기만 하지 않고 불필요한 제작설명 같은것이 들어간것들은 다 제거해서 제작될수 있게 해줘.
+

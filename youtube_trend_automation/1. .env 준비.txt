@@ -1,0 +1,92 @@
+1. .env 준비
+youtube_trend_automation 폴더로 이동
+.env.example 복사:
+Windows: Copy-Item .env.example .env
+Linux/Mac: cp .env.example .env
+.env 파일을 텍스트 에디터로 열기
+2. 필수 설정 항목
+APP_LOG_LEVEL
+목적: 로그 출력 레벨
+값:
+DEBUG, INFO, WARNING, ERROR, CRITICAL
+권장:
+개발/디버그: DEBUG
+운영: INFO
+YTA_ALLOW_NETWORK
+목적: 외부 네트워크 사용 허용 여부
+값:
+true (네트워크 사용 허용)
+false (차단, 테스트/오프라인)
+실제운영: true (구글 트렌드, 뉴스, 유튜브 API 필요시)
+YTA_GOOGLE_TRENDS_GEO
+목적: Google Trends 지역
+값 예: KR, US, JP
+한국 서비스면: KR
+YTA_TOP_K
+목적: 트렌드 키워드 상위 N개
+값: 숫자 (예: 3)
+기본: 3 (상위 3개 주제)
+3. 음성/렌더/업로드 옵션
+YTA_TTS_VOICE
+목적: edge-tts 음성 선택
+값 예:
+ko-KR-SunHiNeural, en-US-JennyNeural 등
+추천: 한국어면 ko-KR-SunHiNeural
+YTA_TTS_RATE
+목적: 말하기 속도
+값 예:
++0%, -10%, +20%
+기본: +0%
+YTA_RENDER_ENABLED
+목적: 영상 렌더링 활성화
+true / false
+false면 ffmpeg 없이 render plan 저장만
+YTA_UPLOAD_ENABLED
+목적: 유튜브 업로드 활성화
+true / false
+테스트: false, 실제: true
+YTA_YOUTUBE_PRIVACY_STATUS
+목적: 업로드 공개 상태
+값: private, public, unlisted
+업무/검증: private, 운영 채널: public/unlisted
+4. YouTube OAuth / 토큰 경로
+OPENAI_API_KEY
+용도: 오픈AI API (GPT 생성 필요 시)
+값: sk-...
+없으면 일부 기능 제한 가능
+YOUTUBE_CLIENT_SECRETS_FILE
+경로: 클라이언트 비밀 JSON 파일
+예: ./oauth/client_secret.json
+값 비워 두면 업로드 무시 또는 mock
+YOUTUBE_TOKEN_FILE
+토큰 저장 파일 경로
+예: ./oauth/token.json
+없으면 로그인 후 생성
+5. 배포 관련 (선택)
+SSH_DEPLOY_HOST / SSH_DEPLOY_USER / SSH_DEPLOY_PATH
+배포 스크립트(deploy/deploy.ps1, deploy/deploy.sh)에 사용
+예:
+SSH_DEPLOY_HOST=123.123.123.123
+SSH_DEPLOY_USER=ubuntu
+SSH_DEPLOY_PATH=/opt/youtube-trend-automation
+6. 실행 순서 (예제)
+.env 완료
+가상환경 생성 + 의존성 설치
+python -m compileall .
+pytest tests
+테스트 모드(네트워크 차단)
+python main.py --mode dry-run --allow-network false
+실 운영 모드
+python main.py --mode run-once --allow-network true
++--skip-upload (업로드 생략)
++--force (강제 실행)
+💡 주의사항
+YTA_ALLOW_NETWORK=false는 오프라인 전체 기능 확인용, 실제 트렌드/업로드는 true.
+YTA_UPLOAD_ENABLED=false로 두면 업로드 단계만 스킵, 나머지(생성-렌더) 수행.
+ffmpeg 설치 안 되어도 작동하나 영상은 outputs/videos/*.render-plan.json만 생성.
+📌 체크리스트
+ .env 복사 완료
+ 필수값(지역, TTS, 렌더, 업로드) 채움
+ OAuth 파일 위치 확인
+ 테스트 먼저 실행 (dry-run)
+ 운영 모드에서 네트워크/업로드 활성화 확인
