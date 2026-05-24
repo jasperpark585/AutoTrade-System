@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.ui.portfolio_fallback import choose_portfolio_snapshot
 from app.ui.time_utils import format_retry_time_kst
@@ -244,7 +249,7 @@ def _render_status_tab() -> dict[str, Any]:
         live_count = int((cand_df["price_source"] == "KIS_LIVE").sum())
         if live_count < total_count:
             st.warning("일부 종목은 실시간 시세를 가져오지 못해 추정가 또는 0원으로 표시됩니다.")
-    st.dataframe(cand_df, use_container_width=True)
+    st.dataframe(cand_df, width="stretch")
     return hb
 
 
@@ -286,9 +291,9 @@ def _render_portfolio_tab(hb: dict[str, Any]) -> None:
 
     st.caption(f"스냅샷 시각: {st.session_state.get('portfolio_snapshot_updated_at', '-')}")
     st.markdown("#### 보유 종목")
-    st.dataframe(pd.DataFrame(snapshot.get("positions", [])), use_container_width=True)
+    st.dataframe(pd.DataFrame(snapshot.get("positions", [])), width="stretch")
     st.markdown("#### 주문/체결")
-    st.dataframe(pd.DataFrame(snapshot.get("orders", [])), use_container_width=True)
+    st.dataframe(pd.DataFrame(snapshot.get("orders", [])), width="stretch")
 
 
 def _render_chart_tab() -> None:
@@ -327,7 +332,7 @@ def _render_chart_tab() -> None:
             tooltip=["ts:T", "event:N", "price:Q", "qty:Q"],
         )
         layers.append(points)
-    st.altair_chart(alt.layer(*layers).properties(height=380), use_container_width=True)
+    st.altair_chart(alt.layer(*layers).properties(height=380), width="stretch")
 
 
 def _render_ops_tab() -> None:
