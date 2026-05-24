@@ -11,6 +11,13 @@ from typing import Any
 
 DB_PATH = Path("data/autotrade.db")
 logger = logging.getLogger(__name__)
+REPORT_TABLE_ALLOWLIST: dict[str, dict[str, str | None]] = {
+    "signals": {"default_where": None},
+    "trades": {"default_where": "status='CLOSED'"},
+    "performance_reports": {"default_where": None},
+    "daily_performance": {"default_where": None},
+    "report_cache": {"default_where": None},
+}
 
 
 class Database:
@@ -93,22 +100,14 @@ class Database:
         return None
 
     def clear_report_data(self, only_dry: bool = True, vacuum: bool = False) -> dict[str, Any]:
-        allowlist = {
-            "signals": {"default_where": None},
-            "trades": {"default_where": "status='CLOSED'"},
-            "performance_reports": {"default_where": None},
-            "daily_performance": {"default_where": None},
-            "report_cache": {"default_where": None},
-        }
-
         existing = self.list_tables()
         deleted: dict[str, int] = {}
         skipped: list[str] = []
 
-        if not any(t in existing for t in allowlist):
+        if not any(t in existing for t in REPORT_TABLE_ALLOWLIST):
             return {
                 "deleted": {},
-                "skipped": list(allowlist.keys()),
+                "skipped": list(REPORT_TABLE_ALLOWLIST.keys()),
                 "vacuum": False,
                 "only_dry": only_dry,
                 "message": "nothing to delete",
@@ -116,7 +115,7 @@ class Database:
 
         def _run_delete() -> None:
             with self.connect() as con:
-                for table, spec in allowlist.items():
+                for table, spec in REPORT_TABLE_ALLOWLIST.items():
                     if table not in existing:
                         skipped.append(table)
                         continue

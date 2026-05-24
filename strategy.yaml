@@ -66,7 +66,7 @@ gpt_scout:
   overheat_volatility_pct: 6.5
   notify_on_refresh: true
   model: "gpt-4.1-mini"
-  user_context: "급등 초기 진입 우선, 이미 과열된 종목 배제"
+  user_context: "급등 초기 진입 우선, 이미 과열된 종목 제외"
   quota_guard:
     enabled: true
     require_paid_opt_in: true

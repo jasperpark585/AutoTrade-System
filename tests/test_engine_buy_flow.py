@@ -10,7 +10,11 @@ from app.services.kis_client import KISCooldownError, Quote
 
 
 class DummyConfigManager:
+    def __init__(self):
+        self.load_count = 0
+
     def load(self):
+        self.load_count += 1
         return {
             "mode": "DRY-RUN",
             "scan_interval_seconds": 60,
@@ -124,6 +128,15 @@ class EngineBuyFlowTests(unittest.TestCase):
         self.assertEqual(row["price_source"], "KIS_LIVE")
         self.assertEqual(float(row["price_krw"]), 71500.0)
         self.assertEqual(float(row["ai_price_krw"]), 42000.0)
+
+    def test_reload_config_skips_immediate_duplicate_load(self):
+        cfg = DummyConfigManager()
+        engine = AutoTradingEngine(cfg, self.db, KakaoNotifier(None))
+        initial_count = cfg.load_count
+
+        engine._reload_config(force=False)
+
+        self.assertEqual(cfg.load_count, initial_count)
 
 
 if __name__ == "__main__":

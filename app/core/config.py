@@ -75,8 +75,7 @@ class ConfigManager:
     def load(self) -> dict[str, Any]:
         with self._lock:
             data = self._read_yaml()
-            mode = _normalize_mode(os.getenv("MODE", str(data.get("mode", "DRY-RUN"))))
-            data["mode"] = mode
+            data["mode"] = _normalize_mode(os.getenv("MODE", str(data.get("mode", "DRY-RUN"))))
 
             scan_env = os.getenv("SCAN_INTERVAL_SECONDS")
             if scan_env:
@@ -90,15 +89,17 @@ class ConfigManager:
         explicit_live = _env_bool("LIVE", default=False)
         env_dry = _env_bool("DRY_RUN", default=(mode != "LIVE"))
         mock_order = _env_bool("KIS_MOCK_ORDER", default=False)
+
         block_reasons: list[str] = []
         if mode != "LIVE":
-            block_reasons.append("전략 모드가 LIVE가 아닙니다.")
+            block_reasons.append("strategy.yaml mode is not LIVE.")
         if not explicit_live:
-            block_reasons.append("환경변수 LIVE=true 가 필요합니다.")
+            block_reasons.append("environment LIVE=true is required.")
         if env_dry:
-            block_reasons.append("환경변수 DRY_RUN=false 가 필요합니다.")
+            block_reasons.append("environment DRY_RUN=false is required.")
         if mock_order:
-            block_reasons.append("환경변수 KIS_MOCK_ORDER=false 가 필요합니다.")
+            block_reasons.append("environment KIS_MOCK_ORDER=false is required.")
+
         live_order_enabled = mode == "LIVE" and explicit_live and (not env_dry) and (not mock_order)
         return {
             "mode": mode,

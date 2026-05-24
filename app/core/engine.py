@@ -82,7 +82,9 @@ class AutoTradingEngine:
             "mock_order": False,
             "live_order_enabled": False,
         }
-        self._reload_config()
+        self._last_config_reload_epoch = 0.0
+        self._config_reload_interval_sec = 1.0
+        self._reload_config(force=True)
         self._check_runtime_writable_paths()
         self._restore_last_good_orderable(source="cached")
         self._load_watchlist_from_storage()
@@ -107,7 +109,10 @@ class AutoTradingEngine:
             "live_order_enabled": False,
         }
 
-    def _reload_config(self) -> None:
+    def _reload_config(self, force: bool = False) -> None:
+        now_epoch = time.time()
+        if not force and (now_epoch - self._last_config_reload_epoch) < self._config_reload_interval_sec:
+            return
         self.base_config = self.cfg_mgr.load()
         self.config = copy.deepcopy(self.base_config)
         if hasattr(self.cfg_mgr, "runtime_flags"):
@@ -126,6 +131,7 @@ class AutoTradingEngine:
         )
         self.strategy = StageStrategy(self.config)
         self.risk = RiskGuard(self.config)
+        self._last_config_reload_epoch = now_epoch
 
     def _sync_enabled_from_db(self) -> None:
         val = self.db.get_engine_state("auto_trading_enabled")
@@ -524,7 +530,7 @@ class AutoTradingEngine:
         self.runtime.current_profile = profile
 
     def tick(self) -> None:
-        self._reload_config()
+        self._reload_config(force=True)
         self.refresh_daily_candidates(force=False, trigger="tick")
         self._sync_enabled_from_db()
         logger.info("tick start enabled=%s blocker=%s", self.runtime.enabled, self.runtime.blocker or "NONE")
@@ -974,7 +980,7 @@ class AutoTradingEngine:
         cfg = self.cfg_mgr.load()
         cfg["mode"] = mode_u
         self.cfg_mgr.save(cfg)
-        self._reload_config()
+        self._reload_config(force=True)
         return self.get_config_summary()
 
     def _is_live_mode(self) -> bool:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+from app.ui.portfolio_fallback import choose_portfolio_snapshot
 from app.ui.time_utils import format_retry_time_kst
 
 try:
@@ -29,22 +31,17 @@ def _inject_style() -> None:
 <style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
 html, body, [class*="css"] {font-family: "Pretendard", "Noto Sans KR", sans-serif !important;}
-[data-testid="stAppViewContainer"] {
-  background:
-    radial-gradient(1400px 700px at -10% -20%, rgba(15, 118, 110, 0.15), transparent 55%),
-    radial-gradient(1100px 700px at 110% -10%, rgba(30, 64, 175, 0.15), transparent 50%),
-    linear-gradient(180deg, #f8fafc 0%, #ecf2f9 100%);
-}
+[data-testid="stAppViewContainer"] {background: linear-gradient(180deg, #f8fafc 0%, #ecf2f9 100%);}
 .hero {
-  background: linear-gradient(135deg, #0f172a 0%, #1e293b 45%, #0f766e 100%);
-  color: #f8fafc; border-radius: 20px; padding: 20px 24px; margin-bottom: 14px;
-  box-shadow: 0 18px 42px rgba(15,23,42,0.25);
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 55%, #0f766e 100%);
+  color: #f8fafc; border-radius: 8px; padding: 20px 24px; margin-bottom: 14px;
+  box-shadow: 0 14px 34px rgba(15,23,42,0.18);
 }
 .hero h1 {margin: 0; font-size: 2rem;}
 .hero p {margin: 8px 0 0 0; opacity: 0.92;}
 [data-testid="stMetric"] {
-  background: rgba(255,255,255,0.82); border-radius: 12px; border: 1px solid rgba(15,23,42,0.08);
-  box-shadow: 0 8px 18px rgba(15,23,42,0.06); padding: 8px 12px;
+  background: rgba(255,255,255,0.86); border-radius: 8px; border: 1px solid rgba(15,23,42,0.08);
+  box-shadow: 0 8px 18px rgba(15,23,42,0.05); padding: 8px 12px;
 }
 </style>
 """,
@@ -54,7 +51,7 @@ html, body, [class*="css"] {font-family: "Pretendard", "Noto Sans KR", sans-seri
 
 def _api_get(path: str) -> dict[str, Any]:
     if requests is None:
-        raise RuntimeError("requests 패키지가 설치되어야 합니다.")
+        raise RuntimeError("requests 패키지가 설치되어 있지 않습니다.")
     resp = requests.get(f"{ENGINE_API_URL}{path}", timeout=10)
     data = resp.json() if resp.content else {}
     if resp.status_code != 200:
@@ -64,7 +61,7 @@ def _api_get(path: str) -> dict[str, Any]:
 
 def _api_post(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     if requests is None:
-        raise RuntimeError("requests 패키지가 설치되어야 합니다.")
+        raise RuntimeError("requests 패키지가 설치되어 있지 않습니다.")
     resp = requests.post(f"{ENGINE_API_URL}{path}", json=payload or {}, timeout=12)
     data = resp.json() if resp.content else {}
     if resp.status_code != 200:
@@ -85,8 +82,6 @@ def _load_snapshot_file() -> dict[str, Any] | None:
     if not SNAPSHOT_FALLBACK_PATH.exists():
         return None
     try:
-        import json
-
         payload = json.loads(SNAPSHOT_FALLBACK_PATH.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else None
     except Exception:
@@ -123,23 +118,9 @@ def _get_candidates() -> dict[str, Any]:
 
 
 def _get_chart(symbol: str, count: int = 180) -> dict[str, Any]:
-    path = f"/chart?symbol={symbol}&count={int(count)}"
-    payload = _api_get(path)
+    payload = _api_get(f"/chart?symbol={symbol}&count={int(count)}")
     result = payload.get("result", {})
     return result if isinstance(result, dict) else {}
-
-
-def _render_live_readiness(hb: dict[str, Any]) -> None:
-    st.markdown("#### LIVE 주문 준비 상태")
-    if bool(hb.get("live_order_enabled")):
-        st.success("실계좌 주문 경로가 활성화되어 있습니다.")
-        return
-    st.warning("실계좌 주문이 차단되어 있습니다.")
-    reasons = hb.get("live_block_reasons", [])
-    if isinstance(reasons, list):
-        for reason in reasons:
-            st.markdown(f"- {reason}")
-    st.caption("필수 조건: mode=LIVE, LIVE=true, DRY_RUN=false, KIS_MOCK_ORDER=false")
 
 
 def _is_truthy_env(name: str) -> bool:
@@ -150,15 +131,28 @@ def _is_truthy_env(name: str) -> bool:
 def _guard_reason_label(reason: str) -> str:
     reason_map = {
         "OPENAI_GUARD_OK": "정상",
-        "OPENAI_PAID_OPT_IN_REQUIRED": "유료 호출 미허용(환경변수 미설정)",
+        "OPENAI_PAID_OPT_IN_REQUIRED": "유료 호출 허용 환경변수 미설정",
         "OPENAI_GUARD_DAILY_LIMIT": "일일 호출 한도 초과",
         "OPENAI_GUARD_MONTHLY_LIMIT": "월간 호출 한도 초과",
         "OPENAI_GUARD_MONTHLY_BUDGET": "월간 예산 한도 초과",
         "OPENAI_GUARD_PER_CALL_ESTIMATE_LIMIT": "호출당 예상비용 한도 초과",
         "OPENAI_GUARD_COOLDOWN": "429 이후 쿨다운 차단 중",
-        "OPENAI_HTTP_429": "OpenAI 429(쿼터/요청 제한)",
+        "OPENAI_HTTP_429": "OpenAI 429(쿼터 또는 요청 제한)",
     }
     return reason_map.get(reason, reason or "-")
+
+
+def _render_live_readiness(hb: dict[str, Any]) -> None:
+    st.markdown("#### LIVE 주문 준비 상태")
+    if bool(hb.get("live_order_enabled")):
+        st.success("실계좌 주문 경로가 활성화되어 있습니다.")
+        return
+    st.warning("실계좌 주문은 차단되어 있습니다.")
+    reasons = hb.get("live_block_reasons", [])
+    if isinstance(reasons, list):
+        for reason in reasons:
+            st.markdown(f"- {reason}")
+    st.caption("필수 조건: mode=LIVE, LIVE=true, DRY_RUN=false, KIS_MOCK_ORDER=false")
 
 
 def _render_openai_guard(hb: dict[str, Any], cands: dict[str, Any]) -> None:
@@ -168,7 +162,7 @@ def _render_openai_guard(hb: dict[str, Any], cands: dict[str, Any]) -> None:
 
     st.markdown("#### OpenAI 쿼터/과금 가드")
     if not guard:
-        st.info("가드 상태 데이터가 아직 없습니다. `/candidates/refresh` 실행 후 갱신됩니다.")
+        st.info("가드 상태 데이터가 아직 없습니다. 후보 갱신 후 표시됩니다.")
         return
 
     req_today = int(guard.get("requests_today", 0) or 0)
@@ -177,15 +171,13 @@ def _render_openai_guard(hb: dict[str, Any], cands: dict[str, Any]) -> None:
     max_month = int(guard.get("max_requests_per_month", 0) or 0)
     cost_month = float(guard.get("cost_usd_this_month", 0.0) or 0.0)
     max_budget = float(guard.get("max_monthly_cost_usd", 0.0) or 0.0)
-    reserve_ratio = float(guard.get("reserve_ratio", 0.9) or 0.9)
     paid_opt_in_env = str(guard.get("paid_opt_in_env") or "OPENAI_PAID_ALLOWED")
-    paid_allowed = _is_truthy_env(paid_opt_in_env)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("오늘 호출", f"{req_today}/{max_day if max_day > 0 else '무제한'}")
-    c2.metric("이번달 호출", f"{req_month}/{max_month if max_month > 0 else '무제한'}")
-    c3.metric("이번달 비용(USD)", f"{cost_month:.4f}/{max_budget if max_budget > 0 else '무제한'}")
-    c4.metric("유료 호출 허용", "허용" if paid_allowed else "차단")
+    c2.metric("이번 달 호출", f"{req_month}/{max_month if max_month > 0 else '무제한'}")
+    c3.metric("이번 달 비용(USD)", f"{cost_month:.4f}/{max_budget if max_budget > 0 else '무제한'}")
+    c4.metric("유료 호출 허용", "허용" if _is_truthy_env(paid_opt_in_env) else "차단")
 
     last_reason = str(guard.get("last_reason") or "")
     reason_label = _guard_reason_label(last_reason)
@@ -199,10 +191,8 @@ def _render_openai_guard(hb: dict[str, Any], cands: dict[str, Any]) -> None:
         kst, utc = format_retry_time_kst(block_until)
         st.info(f"OpenAI 재시도 가능 시각 (KST): {kst} | UTC: {utc}")
 
-    st.caption(
-        f"예산 보호 배수(reserve_ratio): {reserve_ratio:.2f} | "
-        f"옵트인 환경변수: {paid_opt_in_env}=true 일 때만 유료 호출 허용"
-    )
+    reserve_ratio = float(guard.get("reserve_ratio", 0.9) or 0.9)
+    st.caption(f"예산 보호 배수: {reserve_ratio:.2f} | {paid_opt_in_env}=true 일 때만 유료 호출 허용")
 
 
 def _render_status_tab() -> dict[str, Any]:
@@ -238,7 +228,7 @@ def _render_status_tab() -> dict[str, Any]:
 
     if hb.get("next_retry_at"):
         kst, utc = format_retry_time_kst(str(hb.get("next_retry_at")))
-        st.info(f"KIS 재시도 시각 (KST): {kst} | UTC: {utc}")
+        st.info(f"KIS 재시도 가능 시각 (KST): {kst} | UTC: {utc}")
 
     _render_live_readiness(hb)
     _render_openai_guard(hb, cands)
@@ -247,51 +237,52 @@ def _render_status_tab() -> dict[str, Any]:
     st.markdown("#### 오늘 AI 선정 종목")
     st.write(f"출처: `{cands.get('source', '-')}` / 기준일: `{cands.get('date_kst', '-')}`")
     price_updated_at = str(cands.get("price_updated_at") or "-")
-    st.caption(f"가격 기준: KIS 실시간 우선 (갱신시각 UTC: {price_updated_at})")
+    st.caption(f"가격 기준: KIS 실시간 우선 (갱신 시각 UTC: {price_updated_at})")
     cand_df = pd.DataFrame(cands.get("candidates", []))
     if not cand_df.empty and "price_source" in cand_df.columns:
         total_count = len(cand_df.index)
         live_count = int((cand_df["price_source"] == "KIS_LIVE").sum())
         if live_count < total_count:
-            st.warning("일부 종목은 실시간 시세를 가져오지 못해 추정값(또는 0원)으로 표시됩니다.")
+            st.warning("일부 종목은 실시간 시세를 가져오지 못해 추정가 또는 0원으로 표시됩니다.")
     st.dataframe(cand_df, use_container_width=True)
     return hb
 
 
 def _render_portfolio_tab(hb: dict[str, Any]) -> None:
+    live_result: dict[str, Any] | None = None
     if st.button("포트폴리오 새로고침", type="primary"):
-        data = _safe_call(lambda: _api_post("/refresh/portfolio"), "포트폴리오 갱신", default={}) or {}
-        result = data.get("result", {}) if isinstance(data.get("result"), dict) else {}
-        snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else None
-        if bool(data.get("ok")) and isinstance(snapshot, dict):
-            _remember_snapshot(snapshot, source="engine")
+        live_result = _safe_call(lambda: _api_post("/refresh/portfolio"), "포트폴리오 갱신", default={}) or {}
+
+    choice = choose_portfolio_snapshot(
+        live_result=live_result,
+        cached_snapshot=None,
+        file_snapshot=_load_snapshot_file(),
+        session_snapshot=st.session_state.get("portfolio_snapshot"),
+    )
+    snapshot = choice.snapshot
+    if isinstance(snapshot, dict):
+        _remember_snapshot(snapshot, source=choice.source)
+    if live_result is not None:
+        if choice.source == "live_refresh":
             st.session_state["portfolio_last_error"] = None
             st.success("포트폴리오를 갱신했습니다.")
         else:
-            st.session_state["portfolio_last_error"] = result
-            st.warning(f"갱신 실패: {result.get('reason', 'unknown')}")
-
-    snapshot = st.session_state.get("portfolio_snapshot")
-    if not isinstance(snapshot, dict):
-        file_snap = _load_snapshot_file()
-        if isinstance(file_snap, dict):
-            snapshot = file_snap
-            _remember_snapshot(file_snap, source="file")
+            st.session_state["portfolio_last_error"] = live_result.get("result", live_result)
+            st.warning(f"갱신 실패: {choice.warning or 'unknown'}")
 
     if not isinstance(snapshot, dict):
         st.error("표시할 포트폴리오 스냅샷이 없습니다.")
         return
 
-    last_error = st.session_state.get("portfolio_last_error")
-    if isinstance(last_error, dict):
-        st.warning(f"최근 갱신 오류: {last_error.get('reason', '-')}")
+    if choice.warning:
+        st.warning(f"최근 갱신 오류: {choice.warning}")
 
     account = snapshot.get("account", {}) if isinstance(snapshot.get("account"), dict) else {}
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("주문가능현금", f"{float(hb.get('orderable_cash', 0) or 0):,.0f}원")
     c2.metric("D+2 예수금", f"{float(hb.get('d2_cash', 0) or 0):,.0f}원")
     c3.metric("총평가금액", f"{float(account.get('total_eval', 0) or 0):,.0f}원")
-    c4.metric("보유종목수", f"{len(snapshot.get('positions') or [])}개")
+    c4.metric("보유종목", f"{len(snapshot.get('positions') or [])}개")
 
     st.caption(f"스냅샷 시각: {st.session_state.get('portfolio_snapshot_updated_at', '-')}")
     st.markdown("#### 보유 종목")
@@ -361,7 +352,7 @@ st.markdown(
     """
 <div class="hero">
   <h1>국내주식 자동매매 운영센터</h1>
-  <p>AI 장전 종목선정, 실계좌 전환 상태점검, 포트폴리오 모니터링, 매수/매도 시점 차트를 한 화면에서 관리합니다.</p>
+  <p>운영상태, 포트폴리오, 후보 종목, 매매 차트를 한 화면에서 점검합니다. 실계좌 상세는 포트폴리오 탭에서만 표시합니다.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -369,7 +360,7 @@ st.markdown(
 
 tab_status, tab_port, tab_chart, tab_ops = st.tabs(["운영상태", "포트폴리오", "매매차트", "운영도구"])
 with tab_status:
-    hb = _render_status_tab()
+    _render_status_tab()
 with tab_port:
     hb_for_port = _safe_call(_get_heartbeat, "엔진 상태 조회", default={}) or {}
     _render_portfolio_tab(hb_for_port)

@@ -2,10 +2,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.core.database import Database
+from app.core.database import Database, REPORT_TABLE_ALLOWLIST
 
 
 class DatabaseReportClearTests(unittest.TestCase):
+    def test_report_clear_allowlist_is_declared_once(self):
+        self.assertIn("signals", REPORT_TABLE_ALLOWLIST)
+        self.assertIn("trades", REPORT_TABLE_ALLOWLIST)
+        self.assertEqual(REPORT_TABLE_ALLOWLIST["trades"]["default_where"], "status='CLOSED'")
+
     def test_clear_report_data_preserves_open_positions(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "autotrade.db")
