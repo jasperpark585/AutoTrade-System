@@ -60,6 +60,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self._write_json(200, {"ok": True, "config": self.engine.get_config_summary()})
             return
 
+        if self.path == "/broker/credentials":
+            self._write_json(200, {"ok": True, "credentials": self.engine.get_broker_credentials_summary()})
+            return
+
         if self.path.startswith("/trades"):
             limit = 200
             if "?" in self.path:
@@ -120,6 +124,21 @@ class HealthHandler(BaseHTTPRequestHandler):
             enabled = bool(payload.get("enabled", False))
             self.engine.set_auto_trading_enabled(enabled)
             self._write_json(200, {"ok": True, "enabled": enabled})
+            return
+
+        if self.path == "/broker/credentials":
+            payload = self._read_json_body()
+            try:
+                result = self.engine.save_broker_credentials(payload)
+            except Exception as exc:
+                self._write_json(400, {"ok": False, "reason": str(exc)})
+                return
+            self._write_json(200, {"ok": True, "credentials": result})
+            return
+
+        if self.path == "/broker/test":
+            result = self.engine.test_broker_credentials()
+            self._write_json(200 if result.get("ok") else 400, result)
             return
 
         if self.path == "/config/mode":

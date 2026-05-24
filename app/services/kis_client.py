@@ -37,6 +37,7 @@ except ModuleNotFoundError:  # pragma: no cover
         return None
 
 from app.core.market_hours import get_market_status
+from app.core.credentials import BrokerCredentials
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ def calc_trend_slope(values: list[float]) -> float:
 
 
 class KISClient:
-    def __init__(self, dry_run: bool = True, timeout: int = 8) -> None:
+    def __init__(self, dry_run: bool = True, timeout: int = 8, credentials: BrokerCredentials | None = None) -> None:
         self.dry_run = dry_run
         self.timeout = timeout
         self.base_url = os.getenv("KIS_BASE_URL", "https://openapi.koreainvestment.com:9443")
@@ -111,6 +112,18 @@ class KISClient:
         self._token_expire_at: datetime | None = None
         self._token_retry_after_epoch: float = 0.0
         self._token_lock = threading.Lock()
+        if credentials is not None:
+            self.apply_credentials(credentials)
+
+    def apply_credentials(self, credentials: BrokerCredentials) -> None:
+        self.appkey = credentials.appkey
+        self.appsecret = credentials.appsecret
+        self.account_no = credentials.account_no
+        self.base_url = credentials.base_url or self.base_url
+        self.mock_live_order = bool(credentials.is_paper)
+        self._token = None
+        self._token_expire_at = None
+        self._token_retry_after_epoch = 0.0
 
     def update_runtime_flags(self, dry_run: bool, mock_live_order: bool, explicit_live: bool, force_dry_run: bool) -> None:
         self.dry_run = dry_run

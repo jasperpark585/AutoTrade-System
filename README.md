@@ -23,6 +23,7 @@ app/
     streamlit_app.py          # 운영 UI
     portfolio_fallback.py     # 포트폴리오 표시 우선순위 계약
   agents/
+    orchestrator.py           # 전문 에이전트 팀 라우팅/안전 정책
     ops_harness.py            # 읽기 전용 운영 점검 하네스
 tests/
 strategy.yaml
@@ -73,6 +74,20 @@ OpenAI 유료 호출은 `OPENAI_PAID_ALLOWED=true`일 때만 허용되도록 `st
 
 ## 실행
 
+Windows 자동 설치:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1
+```
+
+Ubuntu/EC2 자동 설치:
+
+```bash
+bash scripts/bootstrap_ec2.sh
+```
+
+수동 실행:
+
 ```bash
 python -m venv .venv
 . .venv/bin/activate
@@ -103,9 +118,12 @@ streamlit run app/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.
 ## UI 노출 정책
 
 - 운영상태: 헬스, blocker, LIVE 준비 상태, 후보 종목, OpenAI 가드 상태를 표시합니다.
+- 계좌연결: 개인별 KIS AppKey, AppSecret, 계좌번호를 로컬 암호화 저장소에 등록합니다.
 - 포트폴리오: 실계좌 상세, 보유 종목, 주문/체결을 표시합니다.
 - 매매차트: 가격과 매수/매도 이벤트를 표시합니다.
 - 운영도구: 후보 강제 갱신, 리포트성 기록 삭제를 제공합니다.
+
+계좌 키는 중앙 서버로 전송하지 않는 개인 설치형 구조입니다. 저장값은 `data/autotrade.db`에 암호화되어 들어가며, 복호화 키는 `data/credential.key`에 로컬 파일로 보관됩니다. 이 두 파일은 사용자 장비 밖으로 공유하지 마세요.
 
 포트폴리오 표시 우선순위는 `app/ui/portfolio_fallback.py`에 고정되어 있습니다.
 
@@ -118,7 +136,7 @@ streamlit run app/ui/streamlit_app.py --server.port 8501 --server.address 0.0.0.
 
 `app/agents/ops_harness.py`는 읽기 전용 운영 점검 하네스입니다. 실계좌 주문, 설정 변경, 파일 변경을 하지 않습니다. OpenAI Agents SDK로 확장할 때도 이 하네스는 “상태 요약과 권고”까지만 담당하고, 주문 실행은 엔진의 기존 안전 플래그와 수동 승인 경계를 통과해야 합니다.
 
-공식 Agents SDK 흐름은 `Agent`, `Runner`, `function_tool` 기반으로 구성됩니다. 이 프로젝트에서는 실거래 자동화를 LLM에 직접 위임하지 않고, 운영 점검 컨텍스트를 구조화하는 방식으로만 반영합니다.
+`app/agents/orchestrator.py`는 전략, 리스크, UI, 운영 전문 에이전트 팀의 라우팅과 안전 정책을 정의합니다. 공식 Agents SDK 흐름은 `Agent`, `Runner`, `handoffs`, `guardrails`, `function_tool` 기반으로 확장할 수 있습니다. 이 프로젝트에서는 실거래 자동화를 LLM에 직접 위임하지 않고, 운영 점검 컨텍스트를 구조화하는 방식으로만 반영합니다.
 
 예시:
 

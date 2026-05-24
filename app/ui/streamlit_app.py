@@ -7,13 +7,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import altair as alt
-import pandas as pd
-import streamlit as st
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+import altair as alt
+import pandas as pd
+import streamlit as st
 
 from app.ui.portfolio_fallback import choose_portfolio_snapshot
 from app.ui.time_utils import format_retry_time_kst
@@ -70,7 +70,7 @@ def _api_post(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any
     resp = requests.post(f"{ENGINE_API_URL}{path}", json=payload or {}, timeout=12)
     data = resp.json() if resp.content else {}
     if resp.status_code != 200:
-        raise RuntimeError(f"POST {path} 실패: HTTP {resp.status_code}")
+        raise RuntimeError(f"POST {path} 실패: HTTP {resp.status_code} {data}")
     return data if isinstance(data, dict) else {}
 
 
@@ -109,6 +109,12 @@ def _get_config() -> dict[str, Any]:
     payload = _api_get("/config")
     config = payload.get("config", {})
     return config if isinstance(config, dict) else {}
+
+
+def _get_broker_credentials() -> dict[str, Any]:
+    payload = _api_get("/broker/credentials")
+    credentials = payload.get("credentials", {})
+    return credentials if isinstance(credentials, dict) else {}
 
 
 def _get_trades(limit: int = 400) -> list[dict[str, Any]]:
@@ -253,6 +259,48 @@ def _render_status_tab() -> dict[str, Any]:
     return hb
 
 
+def _render_account_tab() -> None:
+    creds = _safe_call(_get_broker_credentials, "계좌 연결 상태 조회", default={}) or {}
+    status_label = "저장됨" if creds.get("configured") else "미설정"
+    st.metric("한국투자증권 OpenAPI 키", status_label)
+    st.caption(
+        f"AppKey: {creds.get('appkey') or '-'} | "
+        f"계좌번호: {creds.get('account_no') or '-'} | "
+        f"모의투자: {'예' if creds.get('is_paper') else '아니오'}"
+    )
+
+    with st.form("broker_credentials_form"):
+        st.markdown("#### 계좌 연결 정보 입력")
+        appkey = st.text_input("KIS AppKey", type="password")
+        appsecret = st.text_input("KIS AppSecret", type="password")
+        account_no = st.text_input("계좌번호", placeholder="12345678-01")
+        base_url = st.text_input("KIS Base URL", value=str(creds.get("base_url") or "https://openapi.koreainvestment.com:9443"))
+        is_paper = st.checkbox("모의투자 키입니다", value=bool(creds.get("is_paper", False)))
+        submitted = st.form_submit_button("로컬에 암호화 저장", type="primary")
+
+    if submitted:
+        payload = {
+            "appkey": appkey,
+            "appsecret": appsecret,
+            "account_no": account_no,
+            "base_url": base_url,
+            "is_paper": is_paper,
+        }
+        res = _safe_call(lambda: _api_post("/broker/credentials", payload), "계좌 연결 정보 저장", default={}) or {}
+        if res.get("ok"):
+            st.success("계좌 연결 정보를 로컬에 암호화 저장했습니다.")
+            st.rerun()
+
+    if st.button("저장된 연결 정보 점검"):
+        res = _safe_call(lambda: _api_post("/broker/test", {}), "계좌 연결 점검", default={}) or {}
+        if res.get("ok"):
+            st.success(res.get("reason", "CREDENTIALS_SAVED"))
+            st.write(res.get("summary", {}))
+        else:
+            st.warning(res.get("reason", "INVALID_CREDENTIALS"))
+            st.write(res)
+
+
 def _render_portfolio_tab(hb: dict[str, Any]) -> None:
     live_result: dict[str, Any] | None = None
     if st.button("포트폴리오 새로고침", type="primary"):
@@ -357,15 +405,17 @@ st.markdown(
     """
 <div class="hero">
   <h1>국내주식 자동매매 운영센터</h1>
-  <p>운영상태, 포트폴리오, 후보 종목, 매매 차트를 한 화면에서 점검합니다. 실계좌 상세는 포트폴리오 탭에서만 표시합니다.</p>
+  <p>계좌 연결, 운영상태, 포트폴리오, 후보 종목, 매매 차트를 한 화면에서 점검합니다.</p>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-tab_status, tab_port, tab_chart, tab_ops = st.tabs(["운영상태", "포트폴리오", "매매차트", "운영도구"])
+tab_status, tab_account, tab_port, tab_chart, tab_ops = st.tabs(["운영상태", "계좌연결", "포트폴리오", "매매차트", "운영도구"])
 with tab_status:
     _render_status_tab()
+with tab_account:
+    _render_account_tab()
 with tab_port:
     hb_for_port = _safe_call(_get_heartbeat, "엔진 상태 조회", default={}) or {}
     _render_portfolio_tab(hb_for_port)

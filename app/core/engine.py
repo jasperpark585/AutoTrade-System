@@ -12,6 +12,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import ConfigManager
+from app.core.credentials import BrokerCredentials, CredentialStore
 from app.core.database import Database
 from app.core.market_hours import MarketStatus, get_market_status
 from app.core.risk import RiskGuard
@@ -72,6 +73,7 @@ class AutoTradingEngine:
         self.runtime = EngineRuntime()
         self.portfolio_service = PortfolioService()
         self.gpt_scout = GPTScout()
+        self.credential_store = CredentialStore(db)
         self.base_config: dict[str, Any] = {}
         self.config: dict[str, Any] = {}
         self.runtime_flags: dict[str, Any] = {
@@ -121,8 +123,12 @@ class AutoTradingEngine:
             flags = self._default_runtime_flags(self.config)
         self.runtime_flags = flags
 
+        stored_credentials = self.credential_store.load()
+        credentials = stored_credentials if not stored_credentials.validate() else None
         if not hasattr(self, "kis"):
-            self.kis = KISClient(dry_run=bool(flags.get("dry_run", True)))
+            self.kis = KISClient(dry_run=bool(flags.get("dry_run", True)), credentials=credentials)
+        elif credentials is not None:
+            self.kis.apply_credentials(credentials)
         self.kis.update_runtime_flags(
             dry_run=bool(flags.get("dry_run", True)),
             mock_live_order=bool(flags.get("mock_order", False)),
@@ -132,6 +138,34 @@ class AutoTradingEngine:
         self.strategy = StageStrategy(self.config)
         self.risk = RiskGuard(self.config)
         self._last_config_reload_epoch = now_epoch
+
+    def get_broker_credentials_summary(self) -> dict[str, Any]:
+        return self.credential_store.summary()
+
+    def save_broker_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
+        credentials = BrokerCredentials(
+            appkey=str(payload.get("appkey") or "").strip(),
+            appsecret=str(payload.get("appsecret") or "").strip(),
+            account_no=str(payload.get("account_no") or "").strip(),
+            base_url=str(payload.get("base_url") or "https://openapi.koreainvestment.com:9443").strip(),
+            is_paper=bool(payload.get("is_paper", False)),
+        )
+        self.credential_store.save(credentials)
+        self._reload_config(force=True)
+        return self.get_broker_credentials_summary()
+
+    def test_broker_credentials(self) -> dict[str, Any]:
+        credentials = self.credential_store.load()
+        missing = credentials.validate()
+        if missing:
+            return {"ok": False, "reason": "INVALID_CREDENTIALS", "missing": missing, "summary": credentials.masked()}
+        return {
+            "ok": True,
+            "reason": "CREDENTIALS_SAVED",
+            "summary": credentials.masked(),
+            "live_order_enabled": bool(self.runtime_flags.get("live_order_enabled", False)),
+            "readiness_note": "Saved locally. Real KIS account calls require LIVE=true and DRY_RUN=false.",
+        }
 
     def _sync_enabled_from_db(self) -> None:
         val = self.db.get_engine_state("auto_trading_enabled")
@@ -494,6 +528,7 @@ class AutoTradingEngine:
             "ai_candidates": self.runtime.ai_candidates[:10],
             "openai_guard": self.runtime.openai_guard,
             "last_hourly_alert_at": self.runtime.last_hourly_alert_at,
+            "broker_credentials": self.get_broker_credentials_summary(),
             "timestamp": datetime.utcnow().isoformat(),
         }
 
